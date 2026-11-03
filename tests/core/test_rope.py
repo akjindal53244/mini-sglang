@@ -1,15 +1,23 @@
 """Compare the complete RoPE tables, including YaRN amplitude, with Transformers."""
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
-from minisgl.layers import _get_rope
+from minisgl.layers import RotaryEmbedding
 from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 HEAD_DIM, BASE, MAX_POSITION = 64, 10000.0, 8192
 YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 2048}
+
+
+def rope_table(rope_scaling, base=BASE):
+    config = SimpleNamespace(
+        head_dim=HEAD_DIM, rope_theta=base, max_position=MAX_POSITION, rope_scaling=rope_scaling
+    )
+    return RotaryEmbedding(config).cos_sin_cache
 
 
 def hf_tables(rope_scaling):
@@ -60,29 +68,23 @@ def hf_tables(rope_scaling):
         "wide-correction-range",
     ],
 )
-def test_rope_tables_match_transformers(monkeypatch, rope_scaling):
-    # Construction imports the CUDA function; this test only reads the CPU table.
-    monkeypatch.setattr("flashinfer.apply_rope_with_cos_sin_cache_inplace", None, raising=False)
-    rope = _get_rope(HEAD_DIM, HEAD_DIM, MAX_POSITION, BASE, rope_scaling)
-    cos, sin = rope._cos_sin_cache.chunk(2, dim=-1)
+def test_rope_tables_match_transformers(rope_scaling):
+    cos, sin = rope_table(rope_scaling).chunk(2, dim=-1)
     expected_cos, expected_sin = hf_tables(rope_scaling)
     torch.testing.assert_close(cos, expected_cos, atol=1e-4, rtol=1e-5)
     torch.testing.assert_close(sin, expected_sin, atol=1e-4, rtol=1e-5)
 
 
-def test_rope_check_rejects_a_small_base_error(monkeypatch):
-    monkeypatch.setattr("flashinfer.apply_rope_with_cos_sin_cache_inplace", None, raising=False)
-    rope = _get_rope(HEAD_DIM, HEAD_DIM, MAX_POSITION, BASE * 1.05, None)
+def test_rope_check_rejects_a_small_base_error():
     expected_cos, _ = hf_tables(None)
-    cos, _ = rope._cos_sin_cache.chunk(2, dim=-1)
+    cos, _ = rope_table(None, base=BASE * 1.05).chunk(2, dim=-1)
     assert not torch.allclose(cos, expected_cos, atol=2e-3)
 
 
-def test_yarn_check_rejects_missing_amplitude(monkeypatch):
+def test_yarn_check_rejects_missing_amplitude():
     # The old test compared inverse frequencies alone and passed this exact bug.
-    monkeypatch.setattr("flashinfer.apply_rope_with_cos_sin_cache_inplace", None, raising=False)
-    unit_rope = _get_rope(HEAD_DIM, HEAD_DIM, MAX_POSITION, BASE, {**YARN, "attention_factor": 1.0})
+    unit_table = rope_table({**YARN, "attention_factor": 1.0})
     expected_cos, _ = hf_tables(YARN)
     assert expected_cos[0, 0].item() == pytest.approx(1.138629436)
-    assert unit_rope._cos_sin_cache[0, 0].item() == 1.0
-    assert not torch.allclose(unit_rope._cos_sin_cache[:, : HEAD_DIM // 2], expected_cos, atol=2e-3)
+    assert unit_table[0, 0].item() == 1.0
+    assert not torch.allclose(unit_table[:, : HEAD_DIM // 2], expected_cos, atol=2e-3)

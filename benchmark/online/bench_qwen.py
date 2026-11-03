@@ -5,7 +5,7 @@ import os
 import random
 from pathlib import Path
 
-from minisgl.benchmark import (
+from client import (  # benchmark/online/client.py
     benchmark_trace,
     get_model_name,
     process_benchmark_results,

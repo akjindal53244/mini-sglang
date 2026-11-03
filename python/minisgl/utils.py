@@ -20,22 +20,14 @@ from transformers import (
 
 
 @functools.cache
-def get_compute_capability() -> tuple[int, int] | None:
-    """GPU architecture, e.g. (12, 0) for RTX PRO 6000; not the CUDA version."""
+def compute_capability() -> tuple[int, int]:
+    """GPU architecture, e.g. (12, 0) for RTX PRO 6000; (0, 0) without a GPU.
+
+    Comparing numbers does not guarantee that a kernel supports a GPU.
+    """
     import torch
-    import torch.version
 
-    if not torch.cuda.is_available() or not torch.version.cuda:
-        return None
-    return torch.cuda.get_device_capability()
-
-
-def is_compute_capability_at_least(major: int, minor: int = 0) -> bool:
-    """Compare capability numbers; this does not guarantee a kernel supports a GPU."""
-    arch = get_compute_capability()
-    if arch is None:
-        return False
-    return arch >= (major, minor)
+    return torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerBase:
@@ -81,15 +73,10 @@ def load_eos_token_ids(model_path: str, hf_config: PretrainedConfig) -> set[int]
 def download_hf_weight(model_path: str) -> str:
     if os.path.isdir(model_path):
         return model_path
-    try:
-        return snapshot_download(
-            model_path,
-            allow_patterns=["*.safetensors"],
-        )
-    except Exception as e:
-        raise ValueError(
-            f"Model path '{model_path}' is neither a local directory nor a valid model ID: {e}"
-        )
+    # Mistral repos add consolidated.safetensors: the same weights, other names.
+    return snapshot_download(
+        model_path, allow_patterns=["*.safetensors"], ignore_patterns=["consolidated*"]
+    )
 
 
 def div_even(a: int, b: int, allow_replicate: bool = False) -> int:
@@ -144,11 +131,11 @@ def init_logger(name: str):
         return logger
 
     def rank_filter(record):
-        from minisgl.distributed import try_get_tp_info
+        from minisgl.distributed import get_world_info
 
-        tp = try_get_tp_info()
-        record.rank = "" if tp is None else f" rank={tp.rank}"
-        return tp is None or tp.rank == 0 or record.levelno >= logging.WARNING
+        world = get_world_info()
+        record.rank = f" rank={world.rank}" if world.size > 1 else ""
+        return world.is_primary() or record.levelno >= logging.WARNING
 
     handler = logging.StreamHandler(sys.stdout)
     handler.addFilter(rank_filter)
@@ -163,9 +150,3 @@ def init_logger(name: str):
 
 def format_memory(size: int) -> str:
     return f"{size / (1024**3):.2f} GiB"
-
-
-def get_free_memory(device: torch.device) -> int:
-    import torch
-
-    return torch.cuda.mem_get_info(device)[0]

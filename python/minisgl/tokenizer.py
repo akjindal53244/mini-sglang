@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import torch
 import zmq
 from minisgl.message import (
     AbortMsg,
@@ -25,14 +24,14 @@ if TYPE_CHECKING:
     from minisgl.config import Config
 
 
-def tokenize(tokenizer: PreTrainedTokenizerBase, message: TokenizeMsg) -> torch.Tensor:
+def tokenize(tokenizer: PreTrainedTokenizerBase, message: TokenizeMsg) -> list[int]:
     if isinstance(message.text, list):
         # Chat templates already insert special tokens. Tokenizing the rendered
         # string again with add_special_tokens=True can duplicate BOS tokens.
         ids = tokenizer.apply_chat_template(message.text, tokenize=True, add_generation_prompt=True)
     else:
         ids = tokenizer.encode(message.text)
-    return torch.tensor(ids, dtype=torch.int32, device="cpu")
+    return list(ids)
 
 
 @dataclass
@@ -83,7 +82,6 @@ class DetokenizeManager:
         return outputs
 
 
-@torch.inference_mode()
 def tokenize_worker(config: Config, ready) -> None:
     tokenizer = load_tokenizer(config.model_path)
     decoder = DetokenizeManager(tokenizer)

@@ -23,19 +23,8 @@ repos:
         entry: ruff check --fix
         language: system
         types: [python]
-      - id: black
-        name: black
-        entry: black
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format
         language: system
         types: [python]
-
-  - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v21.1.5
-    hooks:
-      - id: clang-format
-        types_or: [c++, cuda]
-        args: [--style=file, --verbose]
-        exclude: |
-          (?x)^(
-            python/minisgl/csrc/include/minisgl/nccl227.h
-          )

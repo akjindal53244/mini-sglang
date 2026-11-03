@@ -31,37 +31,36 @@ class SamplingParams:
 
 @dataclass(eq=False)
 class Request:
-    """A request's CPU history and the lengths used to schedule GPU work.
+    """One request, from admission to its last token.
 
-    ``input_ids`` contains the prompt and output tokens already copied to CPU.
-    ``scheduled_len`` includes output tokens produced by submitted forwards,
-    even when their CPU copies have not been consumed yet. ``cached_len`` is
-    the length whose KV writes have been submitted on the engine stream.
+    ``input_ids`` is the prompt plus every output token already copied to CPU.
+    Two lengths follow the GPU instead: ``cached_len`` tokens have KV writes
+    submitted, and ``scheduled_len`` tokens are, or are being, computed. A prefill
+    chunk ends before ``prompt_len``; its sampled token is discarded.
 
-    Example: after prefill of a 4-token prompt, cached_len=4 and
-    scheduled_len=5. The sampled fifth token has no KV until the next forward.
-    Identity-based equality lets the scheduler keep active requests in a set.
+    Example: after prefill of a 4-token prompt, cached_len=4 and scheduled_len=5.
+    The sampled fifth token has no KV until the next forward, and its CPU copy may
+    still be in flight. Identity-based equality keeps requests hashable.
     """
 
-    input_ids: torch.Tensor  # 1-D CPU int32 token IDs
-    table_idx: int
-    cached_len: int
-    output_len: int
     uid: int
+    input_ids: list[int]
     sampling_params: SamplingParams
-    cache_handle: CacheHandle
-    is_prefill_chunk: bool = False
+    table_idx: int = -1  # Row in page_table and next_tokens, assigned at admission.
+    cache_handle: CacheHandle | None = None
+    cached_len: int = 0
     prompt_len: int = field(init=False)
     scheduled_len: int = field(init=False)
     max_seq_len: int = field(init=False)
     is_finished: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        assert self.input_ids.is_cpu and self.input_ids.ndim == 1
-        self.prompt_len = len(self.input_ids)
-        self.scheduled_len = self.prompt_len
-        self.max_seq_len = self.prompt_len + self.output_len
-        assert 0 <= self.cached_len < self.scheduled_len <= self.max_seq_len
+        self.prompt_len = self.scheduled_len = len(self.input_ids)
+        self.max_seq_len = self.prompt_len + self.sampling_params.max_tokens
+
+    @property
+    def is_prefill_chunk(self) -> bool:
+        return self.scheduled_len < self.prompt_len
 
     @property
     def remaining_tokens(self) -> int:
@@ -73,11 +72,10 @@ class Request:
 
     def advance_after_forward(self) -> None:
         """Advance logical GPU state without waiting for the sampled CPU token."""
+        chunk = self.is_prefill_chunk
         self.cached_len = self.scheduled_len
-        self.scheduled_len += 1
-
-    def append_output_token(self, next_token: torch.Tensor) -> None:
-        self.input_ids = torch.cat([self.input_ids, next_token])
+        if not chunk:  # The sampled token is real: the next forward computes it.
+            self.scheduled_len += 1
 
     @property
     def num_output_tokens(self) -> int:
@@ -90,9 +88,8 @@ class Request:
 
     def __repr__(self) -> str:
         return (
-            f"Request(uid={self.uid}, table_idx={self.table_idx}, "
-            f"cached_len={self.cached_len}, scheduled_len={self.scheduled_len}, "
-            f"max_seq_len={self.max_seq_len})"
+            f"Request(uid={self.uid}, table_idx={self.table_idx}, cached_len={self.cached_len}, "
+            f"scheduled_len={self.scheduled_len}, max_seq_len={self.max_seq_len})"
         )
 
 

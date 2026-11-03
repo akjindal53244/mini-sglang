@@ -13,49 +13,60 @@ every layer by width instead; see the layers in layers.py.
 from __future__ import annotations
 
 import glob
+import os
 import re
-from typing import TYPE_CHECKING, Iterator
+from functools import partial
+from typing import TYPE_CHECKING
 
 import safetensors
 import torch
 from minisgl.config import ModelConfig
 from minisgl.core import Batch
-from minisgl.distributed import DistributedInfo, get_tp_info, recv, send, stage_layers
+from minisgl.distributed import (
+    DistributedInfo,
+    get_tp_info,
+    get_world_info,
+    recv,
+    send,
+    stage_layers,
+)
 from minisgl.layers import (
     MoELayer,
     ParallelLMHead,
     ResidualRMSNorm,
     RMSNorm,
+    RotaryEmbedding,
     RowParallelLinear,
     VocabParallelEmbedding,
-    create_rope,
-    gelu_and_mul,
+    copy_into,
+    load_column_shard,
+    load_whole,
     silu_and_mul,
 )
-from minisgl.utils import cached_load_hf_config, div_ceil, div_even, download_hf_weight
+from minisgl.utils import div_even, download_hf_weight
 from torch import nn
-from torch.nn import functional as F
 from tqdm import tqdm
 
 if TYPE_CHECKING:
     from minisgl.attention import AttentionBackend
-    from minisgl.layers import RotaryEmbedding
 
 
 class GatedFeedForward(nn.Module):
-    """SwiGLU/GEGLU: down(activation(gate(x)) * up(x))."""
+    """SwiGLU: down(silu(gate(x)) * up(x))."""
 
     def __init__(self, config: ModelConfig):
         super().__init__()
+        if config.hidden_act != "silu":
+            raise ValueError(f"Unsupported activation: {config.hidden_act}")
         local_size = div_even(config.intermediate_size, get_tp_info().size)
-        # Shard gate and up separately when loading, then pack [local gate, local up].
+        # Packed [local gate, local up]: the loader shards each before placing it.
         self.gate_up_proj = nn.Linear(config.hidden_size, 2 * local_size, bias=False)
+        self.gate_up_proj.weight.weight_loader = partial(load_column_shard, local_size=local_size)
         self.down_proj = RowParallelLinear(config.intermediate_size, config.hidden_size)
-        self.activation = {"silu": silu_and_mul, "gelu": gelu_and_mul}[config.hidden_act]
 
     @torch.cuda.nvtx.range("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.activation(self.gate_up_proj(x)))
+        return self.down_proj(silu_and_mul(self.gate_up_proj(x)))
 
 
 class MoEFeedForward(nn.Module):
@@ -82,11 +93,27 @@ class RotaryAttention(nn.Module):
         # TP may exceed the number of KV heads: adjacent ranks then replicate a head.
         self.num_kv_heads = div_even(config.num_kv_heads, tp_size, allow_replicate=True)
         self.head_dim, self.layer_id = config.head_dim, layer_id
+        self.total_kv_heads = config.num_kv_heads
         q_size, kv_size = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
         self.qkv_proj = nn.Linear(config.hidden_size, q_size + 2 * kv_size, bias=attention_bias)
+        for param in self.qkv_proj.parameters():
+            param.weight_loader = self._load_qkv
         self.o_proj = RowParallelLinear(config.num_qo_heads * self.head_dim, config.hidden_size)
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps) if qk_norm else None
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps) if qk_norm else None
+
+    def _load_qkv(self, param: nn.Parameter, value: torch.Tensor, shard: str) -> int:
+        """Place this rank's heads of q_proj, k_proj, or v_proj in the packed [Q | K | V]."""
+        tp = get_tp_info()
+        if shard == "q":
+            return copy_into(param.data, value.chunk(tp.size)[tp.rank])
+        if self.total_kv_heads < tp.size:  # Adjacent ranks replicate one KV head.
+            head = tp.rank * self.total_kv_heads // tp.size
+            value = value[head * self.head_dim : (head + 1) * self.head_dim]
+        else:
+            value = value.chunk(tp.size)[tp.rank]
+        q_size, kv_size = self.num_q_heads * self.head_dim, self.num_kv_heads * self.head_dim
+        return copy_into(param.data, value, start=q_size + (kv_size if shard == "v" else 0))
 
     @torch.cuda.nvtx.range("Attention")
     def forward(
@@ -172,7 +199,6 @@ class DecoderForCausalLM(nn.Module):
     def __init__(
         self,
         config: ModelConfig,
-        rope_device="cpu",
         *,
         pp: DistributedInfo,
         attention_bias=False,
@@ -185,7 +211,11 @@ class DecoderForCausalLM(nn.Module):
         )
         is_last = pp.rank == pp.size - 1
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size) if is_last else None
-        self.rope = create_rope(config, rope_device)
+        embedding = self.model.embed_tokens
+        if config.tie_word_embeddings and self.lm_head is not None and embedding is not None:
+            self.lm_head.weight = embedding.weight  # One parameter, loaded once.
+        # Built inside the model's torch.device context and shared by every layer.
+        self.rope = RotaryEmbedding(config)
 
     def forward(self, batch: Batch, backend: AttentionBackend) -> torch.Tensor | None:
         x = self.model(batch, backend, self.rope)
@@ -198,20 +228,22 @@ class DecoderForCausalLM(nn.Module):
         return self.lm_head(x)
 
 
-_SPLIT_DIM_0 = [".q_proj", ".k_proj", ".v_proj", ".gate_proj", ".up_proj"]
-_SPLIT_DIM_1 = [".o_proj", ".down_proj"]
-
-# Merge groups: individual projections -> fused projection
-_MERGED_PROJECTIONS = {
-    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
-    "gate_up_proj": ("gate_proj", "up_proj"),
+# Checkpoint projections that this decoder packs into one parameter.
+_PACKED = {
+    "q_proj": ("qkv_proj", "q"),
+    "k_proj": ("qkv_proj", "k"),
+    "v_proj": ("qkv_proj", "v"),
+    "gate_proj": ("gate_up_proj", 0),
+    "up_proj": ("gate_up_proj", 1),
 }
-_EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
+_EXPERT_PATTERN = re.compile(
+    r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<proj>gate|up|down)_proj\.weight$"
+)
 _LAYER_PATTERN = re.compile(r"^model\.layers\.(?P<idx>\d+)\.(?P<name>.+)$")
 
 
 def _stage_key(key: str, config: ModelConfig, pp: DistributedInfo) -> str | None:
-    """Map a checkpoint key to this pipeline stage, or None if another stage owns it."""
+    """Map a checkpoint key to this pipeline stage, or None if this stage skips it."""
     if (match := _LAYER_PATTERN.match(key)) is not None:
         layers = stage_layers(config.num_layers, pp)
         index = int(match.group("idx"))
@@ -221,114 +253,59 @@ def _stage_key(key: str, config: ModelConfig, pp: DistributedInfo) -> str | None
             else None
         )
     first, last = pp.rank == 0, pp.rank == pp.size - 1
-    if "embed_tokens" in key:  # A tied head on the last stage needs these weights too.
-        return key if first or (last and config.tie_word_embeddings) else None
+    tied = config.tie_word_embeddings
+    if "embed_tokens" in key:
+        if first:  # With one stage, a tied head shares this very parameter.
+            return key
+        return "lm_head.weight" if last and tied else None
+    if key.startswith("lm_head") and tied:
+        return None  # Tied: the head was loaded from embed_tokens.
     return key if last else None  # The final norm and lm_head.
 
 
-def _shard_tensor(key: str, value: torch.Tensor, rank: int, world_size: int, num_kv_heads: int):
-    """Extract this rank's shard, copying slices to release the full checkpoint tensor."""
-    if any(sub in key for sub in _SPLIT_DIM_0):
-        is_kv_proj = any(sub in key for sub in (".k_proj", ".v_proj"))
-        if is_kv_proj and num_kv_heads < world_size:
-            head_dim = value.shape[0] // num_kv_heads
-            head_idx = rank * num_kv_heads // world_size
-            return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
-        return value.chunk(world_size, dim=0)[rank].clone()
-    elif any(sub in key for sub in _SPLIT_DIM_1):
-        return value.chunk(world_size, dim=1)[rank].clone()
-    elif "lm_head" in key or "embed_tokens" in key:
-        num_embeddings = value.shape[0]
-        num_embeddings_per_partition = div_ceil(num_embeddings, world_size)
-        vocab_start_idx = rank * num_embeddings_per_partition
-        vocab_end_idx = min((rank + 1) * num_embeddings_per_partition, num_embeddings)
-        shard = value[vocab_start_idx:vocab_end_idx, :].clone()
-        # Every rank's embedding/head has the same local shape, even when the
-        # vocabulary does not divide TP evenly. Padded logits are trimmed later.
-        padding = num_embeddings_per_partition - len(shard)
-        return F.pad(shard, (0, 0, 0, padding)) if padding else shard
-    else:
-        return value
+def _packed_target(key: str) -> tuple[str, object]:
+    """Checkpoint key -> (parameter name, shard passed to its weight_loader)."""
+    if (match := _EXPERT_PATTERN.match(key)) is not None:
+        expert, proj = int(match.group("idx")), match.group("proj")
+        if proj == "down":
+            return f"{match.group('prefix')}.down_proj", (expert, None)
+        return f"{match.group('prefix')}.gate_up_proj", (expert, 0 if proj == "gate" else 1)
+    for part, (packed, shard) in _PACKED.items():
+        if f".{part}." in key:
+            return key.replace(f".{part}.", f".{packed}."), shard
+    return key, None
 
 
-def _get_merge_info(key: str):
-    for merged, parts in _MERGED_PROJECTIONS.items():
-        for part in parts:
-            if f".{part}." in key:
-                return key.replace(f".{part}.", f".{merged}."), part, parts
-    return None
-
-
-def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
-    """Map an expert-scoped checkpoint key to the packed runtime key."""
-    match = _EXPERT_PATTERN.match(key)
-    if match is None:
-        return None
-
-    packed_name = match.group("name")
-    if packed_name.endswith(".weight"):
-        packed_name = packed_name.removesuffix(".weight")
-    return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
-
-
-def load_weight(
-    model_path: str, device: torch.device, pp: DistributedInfo
-) -> Iterator[tuple[str, torch.Tensor]]:
-    """Yield checkpoint tensors on device, sharded and packed for fused projections.
-
-    Completed groups are yielded immediately; incomplete projections/experts
-    stay in buffers until their remaining checkpoint tensors have been read.
-    """
-
+def load_weights(model: nn.Module, model_path: str, config: ModelConfig, pp: DistributedInfo):
+    """Copy each checkpoint tensor's shard into its parameter, then check none was missed."""
     model_folder = download_hf_weight(model_path)
-    config = ModelConfig.from_hf(cached_load_hf_config(model_path))
     files = glob.glob(f"{model_folder}/*.safetensors")
-    files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
-    tp_info = get_tp_info()
-
-    # Shard each projection BEFORE packing QKV or gate/up. Splitting a packed
-    # tensor evenly would assign ranks the wrong heads/features.
-    merge_buf: dict[str, dict[str, torch.Tensor]] = {}
-    expert_buf: dict[str, dict[int, torch.Tensor]] = {}
-    for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
-        with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
+    # Mistral's consolidated.safetensors repeats the weights under other names.
+    files = [f for f in files if not os.path.basename(f).startswith("consolidated")]
+    params = dict(model.named_parameters())
+    written, seen = dict.fromkeys(params, 0), set()
+    device = str(next(model.parameters()).device)
+    for file in tqdm(files, desc="Loading weights", disable=not get_world_info().is_primary()):
+        with safetensors.safe_open(file, framework="pt", device=device) as f:
             for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
+                # Multimodal checkpoints: keep the language model, skip vision weights.
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
                 key = _stage_key(name.removeprefix("language_model."), config, pp)
                 if key is None:
                     continue
-                raw = f.get_tensor(name)
-                name = key
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
-                del raw
-
-                if (info := _get_merge_info(name)) is None:
-                    out = (name, tensor)
-                else:
-                    merged_key, slot, all_slots = info
-                    merge_buf.setdefault(merged_key, {})[slot] = tensor
-                    if not all(s in merge_buf[merged_key] for s in all_slots):
-                        continue
-                    parts = [merge_buf[merged_key][s] for s in all_slots]
-                    del merge_buf[merged_key]
-                    out = (merged_key, torch.cat(parts, dim=0))
-
-                if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
-                    packed_key, expert_idx = expert_info
-                    slots = expert_buf.setdefault(packed_key, {})
-                    slots[expert_idx] = out[1]
-                    if len(slots) != config.num_experts:
-                        continue
-                    experts = [slots[idx] for idx in range(config.num_experts)]
-                    del expert_buf[packed_key]
-                    yield packed_key, torch.stack(experts, dim=0)
-                else:  # Normal dense model
-                    yield out[0], out[1]
-
-    assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
-    assert not expert_buf, f"Incomplete expert tensors in checkpoint: {list(expert_buf.keys())}"
+                target, shard = _packed_target(key)
+                if target not in params:
+                    raise KeyError(f"Checkpoint tensor {name} has no parameter {target}")
+                # A repeated slice could stand in for a missing one of equal size.
+                if (target, shard) in seen:
+                    raise ValueError(f"Checkpoint tensor {name} is loaded twice")
+                seen.add((target, shard))
+                loader = getattr(params[target], "weight_loader", load_whole)
+                written[target] += loader(params[target], f.get_tensor(name), shard)
+    missing = [name for name, param in params.items() if written[name] != param.numel()]
+    if missing:
+        raise ValueError(f"Checkpoint did not fill {len(missing)} parameters, e.g. {missing[:3]}")
 
 
 # All supported families share the same pre-norm decoder. Keep the actual
@@ -344,11 +321,11 @@ _ARCHITECTURES = {
 
 
 def create_model(
-    model_config: ModelConfig, rope_device="cpu", pp_info: DistributedInfo = DistributedInfo(0, 1)
+    model_config: ModelConfig, pp_info: DistributedInfo = DistributedInfo(0, 1)
 ) -> DecoderForCausalLM:
     architecture = model_config.architecture
     if architecture not in _ARCHITECTURES:
         raise ValueError(f"Unsupported model architecture: {architecture}")
     options = _ARCHITECTURES[architecture]
-    model = DecoderForCausalLM(model_config, rope_device, pp=pp_info, **options)
+    model = DecoderForCausalLM(model_config, pp=pp_info, **options)
     return model.eval().requires_grad_(False)

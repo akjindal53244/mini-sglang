@@ -6,21 +6,22 @@ to GPU execution and back. This educational revamp builds on
 readability goals of [nanoGPT](https://github.com/karpathy/nanoGPT) and
 [nanochat](https://github.com/karpathy/nanochat).
 
-The package has **20 Python files: 19 for inference and serving, one for optional
-benchmark helpers**. The transformer is an ordinary PyTorch `nn.Module`. One
-scheduler handles both offline and online inference. The optimizations remain
-visible: continuous batching, chunked prefill, paged KV storage, radix prefix
-reuse, CUDA graphs, CPU/GPU overlap, tensor and pipeline parallelism, and routed
-experts.
+The package is **17 Python files and no native code**. The transformer is an
+ordinary PyTorch `nn.Module`. One scheduler handles both offline and online
+inference. The optimizations remain visible: continuous batching, chunked prefill,
+paged KV storage, radix prefix reuse, CUDA graphs, CPU/GPU overlap, tensor and
+pipeline parallelism, and routed experts.
 
 ## Run it
 
 The reference environment is **Linux, Python 3.12, PyTorch 2.9.1 with CUDA 12.8**.
 You need an NVIDIA GPU, a compatible driver, the CUDA toolkit (`nvcc`), and a C++
-compiler. The small native kernels compile on first use. The commands below run
-from this checkout; use your own fork when sharing the revamped version.
+compiler: FlashInfer compiles its kernels on first use, and the first launch can
+take about a minute.
 
 ```bash
+git clone https://github.com/akjindal53244/mini-sglang
+cd mini-sglang
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e '.[dev]' -c constraints.txt --torch-backend cu128
@@ -46,10 +47,10 @@ from minisgl.llm import LLM
 
 with LLM(
     "Qwen/Qwen3-0.6B",
-    num_page_override=16384,       # A small, fixed KV pool for this example.
+    num_page_override=16384,  # A small, fixed KV pool for this example.
     max_seq_len_override=2048,
     max_running_req=4,
-    cuda_graph_max_bs=0,
+    cuda_graph_bs=[],  # No CUDA graphs: faster startup for one prompt.
     overlap=False,
     cache_type="naive",
 ) as llm:
@@ -88,11 +89,12 @@ curl http://127.0.0.1:1919/v1/chat/completions \
 
 Add `"stream":true` for SSE output. `/v1/models` lists the loaded model. This is a
 small chat-completions API: it supports text messages, temperature, top-k, top-p,
-output budgets, and cancellation. A worker failure rejects new requests with
-HTTP 503, fails waiting requests, and shuts the server down with a nonzero exit
-code. Unsupported settings such as tools, stop strings, multiple completions,
-and nonzero penalties are rejected. Usage token counts are currently omitted.
-`/generate` retains the original raw-text stream.
+output budgets, and cancellation. Send `"prompt"` instead of `"messages"` to skip
+the chat template. `max_tokens` defaults to 1024, since admission reserves KV for
+the whole budget. A worker failure rejects new requests with HTTP 503, fails
+waiting requests, and shuts the server down with a nonzero exit code. Unsupported
+settings such as tools, stop strings, multiple completions, and nonzero penalties
+are rejected. Usage token counts are currently omitted.
 
 ## Check correctness
 
@@ -107,7 +109,7 @@ The GPU smoke workload repeats prompts, forces chunked prefill, pads decode batc
 checks that a cache hit preserves the logit distribution, and checks KV accounting.
 Reports include checkpoint and software revisions, source hashes, input IDs, and
 output IDs. Use a local Hub snapshot path with `--model` to freeze the checkpoint.
-CPU tests need no model download; radix tests compile a small C++ binding.
+CPU tests need no model download.
 
 On this SM120 setup, the hybrid backend can also be checked with:
 
@@ -134,8 +136,8 @@ Run `python -m minisgl --help` for the CLI. Useful switches are `--attn`,
 The implemented decoder families are Llama, Qwen2/2.5, Qwen3, Qwen3-MoE, and the
 Mistral text decoder. The exact architecture table lives in `models.py`.
 Hybrid/recurrent attention, sliding-window attention, vision input, quantization,
-and speculative decoding are outside this implementation. Qwen3.8-27B support is
-follow-up work.
+and speculative decoding are outside this implementation; a checkpoint with an
+active sliding window is rejected at load. Qwen3.8-27B support is follow-up work.
 
 `--tp N` splits each layer across N ranks; `--pp N` splits the decoder into N stages
 of layers. They are alternatives, not a grid. With fewer GPUs than ranks, ranks
@@ -146,7 +148,6 @@ Optional tools have separate dependencies:
 
 ```bash
 uv pip install -e '.[benchmark]' -c constraints.txt  # OpenAI client + Parquet reader
-uv pip install -e '.[modelscope]'                  # --model-source modelscope
 ```
 
 See [benchmark/README.md](benchmark/README.md) for workloads and timing definitions,

@@ -297,7 +297,9 @@ class TRTLLMBackend:
         self.capture: CaptureBuffers | None = None
         self.capture_bs: list[int] = []
         self.scale = config.head_dim**-0.5
-        self.workspace_buffer = torch.empty(
+        # XQA uses this workspace for synchronization counters; first use needs zeros.
+        # https://docs.flashinfer.ai/generated/flashinfer.decode.xqa_batch_decode_with_kv_cache.html
+        self.workspace_buffer = torch.zeros(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
         )
 

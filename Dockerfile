@@ -48,7 +48,7 @@ RUN useradd --create-home --shell /bin/bash --uid 1001 minisgl
 COPY --from=builder --chown=minisgl:minisgl /app /app
 
 # Create cache directories
-RUN mkdir -p /app/.cache/huggingface /app/.cache/tvm-ffi /app/.cache/flashinfer \
+RUN mkdir -p /app/.cache/huggingface /app/.cache/flashinfer \
     && chown -R minisgl:minisgl /app/.cache
 
 WORKDIR /app
@@ -61,7 +61,6 @@ ENV PYTHONUNBUFFERED=1
 
 # Set up cache directories
 ENV HF_HOME=/app/.cache/huggingface
-ENV TVM_FFI_CACHE_DIR=/app/.cache/tvm-ffi
 ENV FLASHINFER_WORKSPACE_BASE=/app/.cache/flashinfer
 
 USER minisgl

@@ -3,7 +3,7 @@
 import asyncio
 import random
 
-from minisgl.benchmark import (
+from client import (  # benchmark/online/client.py
     benchmark_one,
     benchmark_one_batch,
     generate_prompt,

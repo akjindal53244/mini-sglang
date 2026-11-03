@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import gc
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 from minisgl.core import Batch, Request
-from minisgl.distributed import get_tp_info
-from minisgl.utils import format_memory, get_free_memory, init_logger
+from minisgl.distributed import get_world_info
+from minisgl.utils import format_memory, init_logger
 from tqdm import tqdm
 
 if TYPE_CHECKING:
@@ -19,54 +18,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-@dataclass
-class GraphCaptureBuffer:
-    input_ids: torch.Tensor
-    out_loc: torch.Tensor
-    positions: torch.Tensor
-    logits: torch.Tensor
-
-    @classmethod
-    def init(cls, bs: int, vocab_size: int, device: torch.device) -> GraphCaptureBuffer:
-        return GraphCaptureBuffer(
-            input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-            out_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-            positions=torch.zeros(bs, dtype=torch.int32, device=device),
-            logits=torch.empty(bs, vocab_size, dtype=torch.float32, device=device),
-        )
-
-    def set_batch(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        batch.input_ids = self.input_ids[_slice]
-        batch.out_loc = self.out_loc[_slice]
-        batch.positions = self.positions[_slice]
-
-    def copy_from(self, batch: Batch) -> None:
-        _slice = slice(batch.padded_size)
-        self.input_ids[_slice] = batch.input_ids
-        self.out_loc[_slice] = batch.out_loc
-        self.positions[_slice] = batch.positions
-
-
-def _determine_cuda_graph_bs(
-    cuda_graph_bs: list[int] | None,
-    cuda_graph_max_bs: int | None,
-    free_memory: int,
-    max_running_req: int,
-) -> list[int]:
-    if cuda_graph_bs is not None:
-        return cuda_graph_bs
-
-    if cuda_graph_max_bs is None:
-        cuda_graph_max_bs = 256 if free_memory > 80 * (1 << 30) else 160
-    # No batch exceeds max_running_req; larger graphs would only slow startup.
-    cuda_graph_max_bs = min(cuda_graph_max_bs, max_running_req)
-
-    if cuda_graph_max_bs < 1:
-        return []
-
-    sizes = [1, 2, 4] + list(range(8, cuda_graph_max_bs + 1, 8))
-    return [bs for bs in sizes if bs <= cuda_graph_max_bs]
+def cuda_graph_sizes(max_bs: int) -> list[int]:
+    """1, 2, 4, then every multiple of 8: a batch pads to the next captured size."""
+    return [bs for bs in [1, 2, 4, *range(8, max_bs + 1, 8)] if bs <= max_bs]
 
 
 class GraphRunner:
@@ -77,87 +31,80 @@ class GraphRunner:
         model: DecoderForCausalLM,
         attn_backend: AttentionBackend,
         cuda_graph_bs: list[int] | None,
-        cuda_graph_max_bs: int | None,
-        free_memory: int,
         max_running_req: int,
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Request,
     ) -> None:
-        cuda_graph_bs = _determine_cuda_graph_bs(
-            cuda_graph_bs=cuda_graph_bs,
-            cuda_graph_max_bs=cuda_graph_max_bs,
-            free_memory=free_memory,
-            max_running_req=max_running_req,
-        )
+        if cuda_graph_bs is None:
+            # No batch exceeds max_running_req; larger graphs would only slow startup.
+            cuda_graph_bs = cuda_graph_sizes(min(256, max_running_req))
         self.attn_backend = attn_backend
-        self.max_graph_bs = max(cuda_graph_bs) if cuda_graph_bs else 0
         self.graph_bs_list = sorted(cuda_graph_bs)
+        self.max_graph_bs = max(cuda_graph_bs, default=0)
         self.dummy_req = dummy_req
-        self.stream = stream
-        self.device = device
-        self._capture_graphs(max_seq_len, vocab_size, model)
-
-    def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: DecoderForCausalLM):
         self.graph_map: dict[int, torch.cuda.CUDAGraph] = {}
+        self._capture_graphs(stream, device, model, max_seq_len, vocab_size)
+
+    def _capture_graphs(self, stream, device, model: DecoderForCausalLM, max_seq_len, vocab_size):
         if self.max_graph_bs == 0:
             logger.info("CUDA graphs disabled")
             return
+        # A graph replays fixed addresses. Each batch is copied into the first rows
+        # of these [max_graph_bs] inputs, and every graph writes the same logits rows.
+        size = self.max_graph_bs
+        self.input_ids, self.positions, self.out_loc = (
+            torch.zeros(size, dtype=torch.int32, device=device) for _ in range(3)
+        )
+        self.logits = None  # Only the last pipeline stage has a vocabulary head.
+        if model.lm_head is not None:
+            dtype = model.lm_head.weight.dtype
+            self.logits = torch.empty(size, vocab_size, dtype=dtype, device=device)
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
-
-        torch.cuda.synchronize(self.device)
+        torch.cuda.synchronize(device)
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
+        logger.info(f"Capturing CUDA graphs for batch sizes {self.graph_bs_list}")
+        free_memory = torch.cuda.mem_get_info(device)[0]
 
-        logger.info(f"Start capturing CUDA graphs with sizes: {self.graph_bs_list}")
-        free_memory = get_free_memory(self.device)
-        logger.info(f"Free GPU memory before capturing CUDA graphs: {format_memory(free_memory)}")
-
-        self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
-
-        pbar = tqdm(
-            sorted(self.graph_bs_list, reverse=True),
-            desc="Preparing for capturing CUDA graphs...",
-            unit="batch",
-            disable=not get_tp_info().is_primary(),  # disable for non-primary ranks
-        )
+        sizes = sorted(self.graph_bs_list, reverse=True)  # The largest first sizes the pool.
         pool = None
-        for bs in pbar:
-            free_memory = get_free_memory(self.device)
-            pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {format_memory(free_memory)}"
-            pbar.refresh()
-            graph = torch.cuda.CUDAGraph()
+        for bs in tqdm(sizes, desc="Capturing graphs", disable=not get_world_info().is_primary()):
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
-            self.buffer.set_batch(batch)
+            batch.input_ids, batch.positions = self.input_ids[:bs], self.positions[:bs]
+            batch.out_loc = self.out_loc[:bs]
 
             def run() -> None:
                 logits = model(batch, self.attn_backend)
-                if logits is not None:  # Only the last pipeline stage has logits.
-                    self.buffer.logits[:bs] = logits
+                if logits is not None:
+                    self.logits[:bs] = logits
 
             run()  # A warmup outside the graph performs one-time kernel setup.
-            with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
                 run()
             if pool is None:
-                pool = graph.pool()  # reuse cuda graph handle to reduce memory
+                pool = graph.pool()  # Smaller graphs reuse the largest graph's memory.
             self.graph_map[bs] = graph
 
-        free_memory = get_free_memory(self.device)
-        logger.info(f"Free GPU memory after capturing CUDA graphs: {format_memory(free_memory)}")
+        used = free_memory - torch.cuda.mem_get_info(device)[0]
+        logger.info(f"CUDA graphs use {format_memory(used)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs
 
-    def replay(self, batch: Batch) -> torch.Tensor:
+    def replay(self, batch: Batch) -> torch.Tensor | None:
+        """Return logits [batch.size, vocab], or None on all but the last pipeline stage."""
         assert self.can_use_cuda_graph(batch)
-        self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
+        size = batch.padded_size
+        self.input_ids[:size] = batch.input_ids
+        self.positions[:size] = batch.positions
+        self.out_loc[:size] = batch.out_loc
         self.attn_backend.prepare_for_replay(batch)
-        g.replay()
-        return self.buffer.logits[: batch.size]
+        self.graph_map[size].replay()
+        return None if self.logits is None else self.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size

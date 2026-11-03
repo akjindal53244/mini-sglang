@@ -12,8 +12,8 @@
   for the distinction between unsupported TRT-LLM MLA prefill and alternatives.
 
 - [ ] **Validate TP and PP on real multi-GPU hardware.** Both pass on one GPU with
-  ranks sharing it over loopback TCP. Real interconnects, memory limits per GPU, and
-  `benchmark/kernel/comm.py` (which needs four GPUs) are untested.
+  ranks sharing it over loopback TCP. Real interconnects and memory limits per GPU
+  are untested.
 
 - [ ] **Design Qwen3.8-27B support.** Its hybrid linear/full-attention decoder
   needs recurrent state, new layer and weight mappings, output gates, partial

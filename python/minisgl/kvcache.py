@@ -7,11 +7,48 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import count
 
+import numpy as np
 import torch
+import triton
+import triton.language as tl
 from minisgl.core import Request
 from minisgl.distributed import get_tp_info
-from minisgl.kernel import fast_compare_key
 from minisgl.utils import align_down, div_ceil, div_even
+
+
+@triton.jit
+def _store_kv_kernel(k, v, k_cache, v_cache, out_loc, k_stride, v_stride, D, BLOCK: tl.constexpr):
+    # One program per new token: copy its D = heads * head_dim features to its slot.
+    token = tl.program_id(0)
+    slot = tl.load(out_loc + token).to(tl.int64)
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < D
+    tl.store(k_cache + slot * D + offsets, tl.load(k + token * k_stride + offsets, mask=mask), mask)
+    tl.store(v_cache + slot * D + offsets, tl.load(v + token * v_stride + offsets, mask=mask), mask)
+
+
+def store_kv(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    out_loc: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> None:
+    """k_cache/v_cache: [slots, D]. k/v: [T, D] rows, possibly strided slices of fused QKV."""
+    assert k.stride(-1) == v.stride(-1) == 1 and k_cache.is_contiguous() and v_cache.is_contiguous()
+    D = k_cache.shape[1]
+    grid = (len(out_loc),)
+    _store_kv_kernel[grid](
+        k,
+        v,
+        k_cache,
+        v_cache,
+        out_loc,
+        k.stride(0),
+        v.stride(0),
+        D,
+        BLOCK=triton.next_power_of_2(D),
+    )
 
 
 class MHAKVCache:
@@ -28,19 +65,31 @@ class MHAKVCache:
         device: torch.device,
     ):
         local_heads = div_even(num_kv_heads, get_tp_info().size, allow_replicate=True)
+        self.layout = (num_layers, page_size, local_heads, head_dim)
+        self.device, self.dtype = device, dtype
+        self.resize(num_pages)
+
+    def resize(self, num_pages: int) -> None:
+        """Replace the storage. Startup sizes it twice: for a warm-up, then for real."""
+        self.k = self.v = None
+        torch.cuda.empty_cache()
+        layers, page_size, heads, head_dim = self.layout
         # One big allocation. self.k[layer] is [page, token, local head, head_dim].
         buffer = torch.empty(
-            (2, num_layers, num_pages, page_size, local_heads, head_dim), device=device, dtype=dtype
+            (2, layers, num_pages, page_size, heads, head_dim), device=self.device, dtype=self.dtype
         )
         self.k, self.v = buffer.unbind(0)
-        self.device, self.dtype = device, dtype
 
     def store_kv(self, k: torch.Tensor, v: torch.Tensor, out_loc: torch.Tensor, layer_id: int):
-        from minisgl.kernel import store_cache
-
-        # Flatten page and token dimensions: out_loc contains physical token
-        # slots even when attention kernels address this storage by whole pages.
-        store_cache(self.k[layer_id].flatten(0, 1), self.v[layer_id].flatten(0, 1), out_loc, k, v)
+        # Flatten [page, token, head, dim] to [slot, head * dim]: out_loc holds
+        # physical token slots even when attention kernels address whole pages.
+        store_kv(
+            self.k[layer_id].flatten(0, 1).flatten(1),
+            self.v[layer_id].flatten(0, 1).flatten(1),
+            out_loc,
+            k,
+            v,
+        )
 
 
 # A logical clock orders LRU eviction. Wall time could tie differently per process,
@@ -160,11 +209,9 @@ class RadixPrefixCache:
         return prefix_len, CacheHandle(insert_len, node)
 
     def evict(self, size: int) -> torch.Tensor:
-        if size == 0:
-            return self.empty_tensor
-        assert (
-            size <= self.evictable_size
-        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
+        assert 0 < size <= self.evictable_size, (
+            f"Cannot evict {size}, only {self.evictable_size} is evictable"
+        )
 
         leaves = self._collect_evictable_leaves()
         heapq.heapify(leaves)
@@ -248,7 +295,7 @@ class RadixPrefixCache:
             node = child_node  # walk to child node
 
             # The child key guarantees at least the first page matches.
-            match_len = fast_compare_key(node.key, input_ids[prefix_len:])
+            match_len = _common_prefix_len(node.key, input_ids[prefix_len:])
             match_len = align_down(match_len, self.page_size)
             prefix_len += match_len
 
@@ -264,6 +311,13 @@ class RadixPrefixCache:
         return node, prefix_len
 
 
+def _common_prefix_len(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Length of the equal prefix of two 1-D CPU token tensors."""
+    n = min(len(a), len(b))
+    differ = np.flatnonzero(a[:n].numpy() != b[:n].numpy())
+    return int(differ[0]) if len(differ) else n
+
+
 class KVCacheManager:
     """Allocate physical pages and coordinate ownership with the prefix cache.
 
@@ -275,8 +329,6 @@ class KVCacheManager:
         # For page_size=4, [0, 4, 8] denotes three free pages, not three tokens.
         device = page_table.device
         self.free_pages = torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
-        if cache_type not in ("radix", "naive"):
-            raise ValueError(f"Unknown prefix cache: {cache_type}")
         self.prefix_cache = RadixPrefixCache(
             device=device, page_size=page_size, enabled=cache_type == "radix"
         )
@@ -319,7 +371,7 @@ class KVCacheManager:
         # Cancellation can arrive before an in-flight token reaches CPU. Cache
         # only tokens whose IDs are known; release the remaining KV on finish.
         known_len = min(req.cached_len, len(req.input_ids))
-        insert_ids = req.input_ids[:known_len]
+        insert_ids = torch.as_tensor(req.input_ids[:known_len], dtype=torch.int32)
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle
         existing_len, new_handle = self.prefix_cache.insert_prefix(

@@ -6,14 +6,14 @@ work, then retire a completed batch. The same step serves online and offline use
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from itertools import accumulate
+from dataclasses import replace
+from itertools import accumulate, chain
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from minisgl.config import Config
-from minisgl.core import Batch, Request, SamplingParams
-from minisgl.engine import Engine, prepare_sampling_args
+from minisgl.core import Batch, Request
+from minisgl.engine import Engine, make_device_tensor, prepare_sampling_args
 from minisgl.kvcache import KVCacheManager
 from minisgl.message import (
     AbortMsg,
@@ -30,21 +30,15 @@ if TYPE_CHECKING:
     from minisgl.engine import BatchSamplingArgs, ForwardOutput
 
 
-@dataclass
-class PendingRequest:
-    uid: int
-    input_ids: torch.Tensor  # Full prompt stays on CPU while chunks run on GPU.
-    sampling_params: SamplingParams
-    chunked_req: Request | None = None
-
-
 class ScheduledBatch(NamedTuple):
-    # Keep index tensors alive until GPU gathers/scatters have completed. They
-    # are made on the metadata stream and consumed on the engine stream.
     batch: Batch
     sampling_args: BatchSamplingArgs
-    input_indices: tuple[torch.Tensor, torch.Tensor]
-    output_indices: tuple[torch.Tensor, torch.Tensor]
+    # [padded_size] request rows. Made on the metadata stream but read later on the
+    # engine stream, so it must stay alive until this batch completes.
+    rows: torch.Tensor
+    # Rows whose sampled token is output. Record it now: with overlap, a chunked
+    # request has already moved on to its next chunk when this batch completes.
+    emits: list[bool]
 
 
 class InFlightBatch(NamedTuple):
@@ -58,15 +52,17 @@ class Scheduler:
         self.config = self.engine.config  # Resolved backend and allocation page size.
         self.device = self.engine.device
         self.scheduler_stream = torch.cuda.Stream(device=self.device)
-        # [requests + 1, max_seq_len], like page_table: row r, position p -> token ID.
-        self.token_pool = torch.zeros_like(self.engine.page_table)
+        # [requests + 1]: each row's latest sampled token, which its next decode reads
+        # on the GPU without waiting for the CPU copy. The extra row feeds graph padding.
+        rows = len(self.engine.page_table)
+        self.next_tokens = torch.zeros(rows, dtype=torch.int32, device=self.device)
         self.free_rows = list(range(config.max_running_req))
         self.cache_manager = KVCacheManager(
             self.engine.num_pages, self.config.page_size, self.engine.page_table, config.cache_type
         )
         self.eos_token_ids = load_eos_token_ids(config.model_path, config.hf_config)
-        self.pending: list[PendingRequest] = []
-        self.running: set[Request] = set()
+        self.pending: list[Request] = []  # Waiting, or partway through a chunked prefill.
+        self.running: list[Request] = []  # Decoding. Lists keep the same order on every rank.
         self.in_flight: InFlightBatch | None = None
 
     @property
@@ -77,12 +73,10 @@ class Scheduler:
     @torch.inference_mode()
     def step(self, messages: list[Message]) -> list[Message]:
         """Submit one batch and return tokens ready for the caller to deliver."""
+        # With overlap, batch metadata is copied on a side stream while the previous
+        # forward runs. That forward reads only its own copies, never page_table.
         stream = self.scheduler_stream if self.config.overlap else self.engine.stream
         with torch.cuda.stream(stream):
-            # Reused request rows must not race the preceding forward's token
-            # writes. This GPU dependency still lets CPU admission run ahead.
-            if self.config.overlap:
-                stream.wait_stream(self.engine.stream)
             replies = []
             for message in messages:
                 replies.extend(self._handle_message(message))
@@ -123,7 +117,7 @@ class Scheduler:
                 message.sampling_params,
                 max_tokens=min(message.sampling_params.max_tokens, available_output),
             )
-            self.pending.append(PendingRequest(message.uid, message.input_ids, params))
+            self.pending.append(Request(message.uid, list(message.input_ids), params))
         else:
             raise TypeError(f"Unknown scheduler message: {type(message).__name__}")
         return []
@@ -139,93 +133,78 @@ class Scheduler:
         reserved = sum(
             self._future_kv_tokens(r.cached_len, r.max_seq_len - 1) for r in self.running
         )
-        requests, chunks = [], []
-        for pending in self.pending:
-            if budget == 0:
+        scheduled = []
+        for request in self.pending:
+            if budget == 0 or (request.table_idx < 0 and not self._admit(request, reserved)):
                 break
-            ids, params = pending.input_ids, pending.sampling_params
-            previous = pending.chunked_req
-            if previous is not None:
-                handle, row, cached_len = (
-                    previous.cache_handle,
-                    previous.table_idx,
-                    previous.cached_len,
-                )
-            else:
-                if not self.free_rows:
-                    break
-                # Cache KV, not logits: recompute at least the final prompt token.
-                handle = self.cache_manager.prefix_cache.match_prefix(ids[:-1])
-                cached_len = handle.cached_len
-                needed = self._future_kv_tokens(cached_len, len(ids) + params.max_tokens - 1)
-                if needed + reserved > self.cache_manager.available_tokens:
-                    break
-                self.cache_manager.lock(handle)
-                # The match was evictable before locking, so capacity changed.
-                if needed + reserved > self.cache_manager.available_tokens:
-                    self.cache_manager.unlock(handle)
-                    break
-                row = self.free_rows.pop()
-                if cached_len:  # token_pool needs no prefix: only new tokens are read.
-                    self.engine.page_table[row, :cached_len].copy_(handle.get_matched_indices())
+            reserved += self._future_kv_tokens(request.cached_len, request.max_seq_len - 1)
+            request.scheduled_len = min(request.cached_len + budget, request.prompt_len)
+            budget -= request.num_new_tokens
+            scheduled.append(request)
+        # An unfinished prompt keeps its place at the front of the queue.
+        chunks = [r for r in scheduled if r.is_prefill_chunk]
+        self.pending = chunks + self.pending[len(scheduled) :]
+        return Batch(scheduled, "prefill") if scheduled else None
 
-            reserved += self._future_kv_tokens(cached_len, len(ids) + params.max_tokens - 1)
-            end = min(cached_len + budget, len(ids))
-            self.token_pool[row, cached_len:end].copy_(
-                ids[cached_len:end].pin_memory(), non_blocking=True
-            )
-            request = Request(
-                input_ids=ids[:end],
-                table_idx=row,
-                cached_len=cached_len,
-                output_len=params.max_tokens,
-                uid=pending.uid,
-                sampling_params=params,
-                cache_handle=handle,
-                is_prefill_chunk=end < len(ids),
-            )
-            budget -= end - cached_len
-            pending.chunked_req = request if request.is_prefill_chunk else None
-            if request.is_prefill_chunk:
-                chunks.append(pending)
-            requests.append(request)
-
-        self.pending = chunks + self.pending[len(requests) :]
-        return Batch(requests, "prefill") if requests else None
+    def _admit(self, request: Request, reserved: int) -> bool:
+        """Give a new request a row and its cached prefix, if its KV budget fits."""
+        if not self.free_rows:
+            return False
+        # Cache KV, not logits: recompute at least the final prompt token.
+        prefix = torch.tensor(request.input_ids[:-1], dtype=torch.int32)
+        handle = self.cache_manager.prefix_cache.match_prefix(prefix)
+        needed = self._future_kv_tokens(handle.cached_len, request.max_seq_len - 1)
+        if needed + reserved > self.cache_manager.available_tokens:
+            return False
+        self.cache_manager.lock(handle)
+        # The match was evictable before locking, so capacity changed.
+        if needed + reserved > self.cache_manager.available_tokens:
+            self.cache_manager.unlock(handle)
+            return False
+        request.table_idx, request.cache_handle = self.free_rows.pop(), handle
+        request.cached_len = handle.cached_len
+        if handle.cached_len:  # Point the row at the shared prefix's KV slots.
+            row = self.engine.page_table[request.table_idx, : handle.cached_len]
+            row.copy_(handle.get_matched_indices())
+        return True
 
     def _schedule_next_batch(self) -> ScheduledBatch | None:
         batch = self._prefill_batch()
         if batch is None and self.running:
-            # A Python set's order differs across TP processes. Every rank must
-            # use the same row order before executing collective operations.
-            batch = Batch(sorted(self.running, key=lambda request: request.uid), "decode")
+            batch = Batch(list(self.running), "decode")
         return self._prepare_batch(batch) if batch is not None else None
 
     def _prepare_batch(self, batch: Batch) -> ScheduledBatch:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions, rows = _token_positions_and_rows(batch, self.device)  # Both [T].
-        input_indices = (rows, batch.positions.long())
-        output_indices = _output_indices(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_indices]  # [T] physical token slots
-        if batch.is_prefill:
+        device = self.device
+        batch.positions, token_rows = _token_positions_and_rows(batch, device)  # Both [T].
+        batch.out_loc = self.engine.page_table[token_rows, batch.positions.long()]  # KV slots
+        rows = make_device_tensor([r.table_idx for r in batch.padded_reqs], torch.int64, device)
+        if batch.is_prefill:  # Prompt tokens come from CPU; decode reads next_tokens instead.
+            chunks = (r.input_ids[r.cached_len : r.scheduled_len] for r in batch.reqs)
+            batch.input_ids = make_device_tensor(list(chain(*chunks)), torch.int32, device)
             # The model needs one logit row per request, regardless of the
             # attention library's private metadata representation.
             ends = accumulate(r.num_new_tokens for r in batch.reqs)
-            batch.last_token_indices = torch.tensor(
-                [end - 1 for end in ends], dtype=torch.int64, pin_memory=True
-            ).to(self.device, non_blocking=True)
+            batch.last_token_indices = make_device_tensor(
+                [e - 1 for e in ends], torch.int64, device
+            )
         self.engine.attn_backend.prepare_metadata(batch)
-        args = prepare_sampling_args(batch, self.device, self.config.model_config.vocab_size)
-        return ScheduledBatch(batch, args, input_indices, output_indices)
+        args = prepare_sampling_args(batch, device, self.config.model_config.vocab_size)
+        emits = [not r.is_prefill_chunk for r in batch.reqs]
+        return ScheduledBatch(batch, args, rows, emits)
 
     def _run_batch(self, scheduled: ScheduledBatch) -> ForwardOutput:
-        batch = scheduled.batch
-        batch.input_ids = self.token_pool[scheduled.input_indices]
+        batch, rows = scheduled.batch, scheduled.rows
+        if batch.is_decode:  # The previous samples may not have reached the CPU yet.
+            batch.input_ids = self.next_tokens[rows]
         output = self.engine.forward_batch(batch, scheduled.sampling_args)
-        # Feed the next decode directly from GPU IDs, without waiting for D2H.
-        self.token_pool[scheduled.output_indices] = output.next_tokens_gpu
-        self.running = {r for r in self.running.union(batch.reqs) if r.can_decode}
+        # A prefill chunk's sample is discarded, and harmless here: the request's
+        # final chunk overwrites this slot before any decode reads it.
+        self.next_tokens[rows[: batch.size]] = output.next_tokens_gpu
+        # dict.fromkeys drops duplicates and keeps order, identically on every rank.
+        self.running = [r for r in dict.fromkeys(self.running + batch.reqs) if r.can_decode]
         return output
 
     def _process_completed_batch(self, completed: InFlightBatch | None) -> list[DetokenizeMsg]:
@@ -234,17 +213,17 @@ class Scheduler:
         completed.output.copy_done_event.synchronize()
         replies = []
         with self.cache_manager.defer_page_frees():
-            for index, request in enumerate(completed.scheduled.batch.reqs):
+            scheduled = completed.scheduled
+            for index, (request, emits) in enumerate(zip(scheduled.batch.reqs, scheduled.emits)):
                 # Overlap may submit a lookahead before EOS/cancellation is
                 # observed. Intermediate chunks and retired requests never reply.
-                if request.is_prefill_chunk or request.is_finished:
+                if not emits or request.is_finished:
                     continue
-                token = completed.output.next_tokens_cpu[index]
-                request.append_output_token(token.unsqueeze(0))
-                token_id, reason = int(token), None
+                token_id, reason = int(completed.output.next_tokens_cpu[index]), None
+                request.input_ids.append(token_id)
                 if not request.sampling_params.ignore_eos and token_id in self.eos_token_ids:
                     reason = "stop"
-                elif request.num_output_tokens >= request.output_len:
+                elif request.num_output_tokens >= request.sampling_params.max_tokens:
                     reason = "length"
                 # Only delivered CPU tokens count toward the output budget;
                 # scheduled_len may already include the following forward.
@@ -258,7 +237,8 @@ class Scheduler:
 
     def _free_request(self, request: Request) -> None:
         request.is_finished = True
-        self.running.discard(request)
+        if request in self.running:
+            self.running.remove(request)
         self.free_rows.append(request.table_idx)
         self.cache_manager.cache_req(request, finished=True)
 
@@ -266,8 +246,8 @@ class Scheduler:
         for index, pending in enumerate(self.pending):
             if pending.uid == uid:
                 self.pending.pop(index)
-                if pending.chunked_req is not None:
-                    self._free_request(pending.chunked_req)
+                if pending.table_idx >= 0:  # Admitted: a chunked prefill is underway.
+                    self._free_request(pending)
                 return
         candidates = list(self.running)
         if self.in_flight is not None:
@@ -293,15 +273,3 @@ def _token_positions_and_rows(batch: Batch, device: torch.device):
         rows[offset:end].fill_(request.table_idx)
         offset = end
     return positions.to(device, non_blocking=True), rows.to(device, non_blocking=True)
-
-
-def _output_indices(batch: Batch, device: torch.device):
-    rows = torch.tensor([r.table_idx for r in batch.reqs], dtype=torch.int64, pin_memory=True)
-    # Intermediate chunks discard sampled IDs into the last column, away from
-    # the next chunk's prompt tokens. Dummy rows never produce an output.
-    positions = torch.tensor(
-        [r.scheduled_len if r.can_decode else -1 for r in batch.reqs],
-        dtype=torch.int64,
-        pin_memory=True,
-    )
-    return rows.to(device, non_blocking=True), positions.to(device, non_blocking=True)

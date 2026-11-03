@@ -27,6 +27,7 @@ python -m minisgl --model Qwen/Qwen3-0.6B
 python benchmark/online/bench_simple.py
 ```
 
+Both clients import their HTTP timing helpers from `client.py` beside them.
 `bench_simple.py` sends a concurrent synthetic batch. `bench_qwen.py` downloads
 Qwen's anonymous usage trace and replays arrival times and requested lengths.
 It creates synthetic text, so chat-template overhead and tokenization can change
@@ -41,15 +42,12 @@ of generated tokens. Budget throughput assumes requests complete their budgets;
 context clipping or an error invalidates that assumption. These scripts do not
 establish parity or reproduce upstream published benchmark charts.
 
-## Native kernel measurements
+## Custom kernel measurement
 
 ```bash
-python benchmark/kernel/index.py
 python benchmark/kernel/store.py
-python benchmark/kernel/comm.py
 ```
 
-Index/store scripts check results against PyTorch and time kernels with CUDA
-events and graph replay. The communication script currently uses **four GPUs**
-and checks PyNCCL all-reduce/all-gather; edit its constants for another setup.
-Kernel timings omit model scheduling, HTTP overhead, and startup/JIT compilation.
+The script checks the Triton KV store against PyTorch indexing, then times both
+inside CUDA graphs, as decode runs them. Kernel timings omit model scheduling,
+HTTP overhead, and startup/JIT compilation.

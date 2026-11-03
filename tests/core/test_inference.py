@@ -1,7 +1,6 @@
 """CPU regressions for state, cache ownership, checkpoint layout, and API cleanup.
 
-No CUDA device or downloaded model is needed. Native radix comparison uses the
-normal TVM FFI binding, so a C++ compiler is required.
+No downloaded model is needed.
 """
 
 import asyncio
@@ -13,16 +12,22 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import torch
-from minisgl.config import Config
+from minisgl.config import Config, ModelConfig
 from minisgl.core import Batch, Request, SamplingParams
 from minisgl.distributed import DistributedInfo, stage_layers
-from minisgl.engine import ForwardOutput, prepare_sampling_args, resolve_engine_config, sample
-from minisgl.graph import _determine_cuda_graph_bs
+from minisgl.engine import (
+    ForwardOutput,
+    largest_prefill,
+    prepare_sampling_args,
+    resolve_engine_config,
+    sample,
+)
+from minisgl.graph import GraphRunner, cuda_graph_sizes
 from minisgl.kvcache import KVCacheManager
-from minisgl.layers import ParallelLMHead, RowParallelLinear
+from minisgl.layers import ParallelLMHead
 from minisgl.llm import LLM
 from minisgl.message import AbortMsg, DetokenizeMsg, TokenizeMsg, UserReply
-from minisgl.models import _shard_tensor, _stage_key, create_model
+from minisgl.models import _stage_key, create_model, load_weights
 from minisgl.scheduler import InFlightBatch, Scheduler
 from minisgl.server import (
     FrontendManager,
@@ -45,10 +50,8 @@ class TestAttentionBackendSelection(unittest.TestCase):
             dtype=torch.bfloat16,
             **kwargs,
         )
-        # Avoid downloading a model config in this CPU-only configuration test.
-        object.__setattr__(config, "model_config", SimpleNamespace(is_moe=False))
         with (
-            patch("minisgl.utils.get_compute_capability", return_value=capability),
+            patch("minisgl.engine.compute_capability", return_value=capability),
             patch("minisgl.engine.logger"),
         ):
             resolved = resolve_engine_config(config)
@@ -96,11 +99,31 @@ def test_unsupported_dtype_fails_before_reaching_a_kernel():
         Config("unused", dtype=torch.float32)
 
 
-def test_tp_and_pp_are_alternatives_and_pp_requires_pynccl():
+def test_tp_and_pp_are_alternatives():
     with pytest.raises(ValueError, match="not both"):
         Config("unused", tp_info=DistributedInfo(0, 2), pp_info=DistributedInfo(0, 2))
-    with pytest.raises(ValueError, match="PyNCCL"):
-        Config("unused", pp_info=DistributedInfo(0, 2), use_pynccl=False)
+
+
+def test_active_sliding_windows_are_rejected_rather_than_attending_too_far():
+    from transformers import MistralConfig, Qwen2Config
+
+    small = {"hidden_size": 128, "num_attention_heads": 2, "max_position_embeddings": 64}
+    with pytest.raises(ValueError, match="Sliding-window"):
+        ModelConfig.from_hf(MistralConfig(sliding_window=8, **small))
+    ModelConfig.from_hf(MistralConfig(sliding_window=None, **small))
+    ModelConfig.from_hf(MistralConfig(sliding_window=64, **small))  # Covers the whole context.
+    ModelConfig.from_hf(Qwen2Config(sliding_window=8, use_sliding_window=False, **small))
+
+
+@pytest.mark.parametrize(
+    "max_running_req,context,expected",
+    [(32, 64, [63] * 32), (3, 64, [63, 63, 63]), (1, 64, [63]), (3, 8192, [683, 683, 682])],
+)
+def test_warmup_covers_the_largest_batch_the_scheduler_can_form(max_running_req, context, expected):
+    # Several short prompts can fill the prefill budget when one alone cannot.
+    config = Config("unused", max_running_req=max_running_req, max_extend_tokens=2048)
+    object.__setattr__(config, "model_config", SimpleNamespace(max_position=context))
+    assert largest_prefill(config) == expected
 
 
 @pytest.mark.parametrize("num_layers,stages", [(28, 2), (28, 3), (7, 3), (4, 4)])
@@ -114,34 +137,28 @@ def test_pipeline_stages_load_only_their_own_weights_under_local_names():
     config = SimpleNamespace(num_layers=4, tie_word_embeddings=True)
     stages = [DistributedInfo(0, 2), DistributedInfo(1, 2)]
     expected = {
-        "model.embed_tokens.weight": ["model.embed_tokens.weight"] * 2,  # Tied to last stage.
+        # Tied: the last stage has no embedding, so its head loads this tensor.
+        "model.embed_tokens.weight": ["model.embed_tokens.weight", "lm_head.weight"],
         "model.layers.1.mlp.up_proj.weight": ["model.layers.1.mlp.up_proj.weight", None],
         "model.layers.3.mlp.up_proj.weight": [None, "model.layers.1.mlp.up_proj.weight"],
         "model.norm.weight": [None, "model.norm.weight"],
-        "lm_head.weight": [None, "lm_head.weight"],
+        "lm_head.weight": [None, None],  # A tied head never loads a second copy.
     }
     for key, owners in expected.items():
         assert [_stage_key(key, config, pp) for pp in stages] == owners
     config.tie_word_embeddings = False
     assert _stage_key("model.embed_tokens.weight", config, stages[1]) is None
+    assert _stage_key("lm_head.weight", config, stages[1]) == "lm_head.weight"
 
 
 def make_request(output_len=2):
-    return Request(
-        input_ids=torch.tensor([1, 2, 3], dtype=torch.int32),
-        table_idx=0,
-        cached_len=0,
-        output_len=output_len,
-        uid=42,
-        sampling_params=SamplingParams(max_tokens=output_len),
-        cache_handle=None,
-    )
+    return Request(42, [1, 2, 3], SamplingParams(max_tokens=output_len), table_idx=0)
 
 
 def make_scheduler():
     scheduler = object.__new__(Scheduler)
     scheduler.eos_token_ids = {99}
-    scheduler.running = set()
+    scheduler.running = []
     scheduler.free_rows = []
     scheduler.pending = []
     scheduler.in_flight = None
@@ -151,7 +168,7 @@ def make_scheduler():
 
 def deliver(scheduler, request, token, phase="decode"):
     output = ForwardOutput(None, torch.tensor([token]), SimpleNamespace(synchronize=lambda: None))
-    scheduled = SimpleNamespace(batch=Batch([request], phase))
+    scheduled = SimpleNamespace(batch=Batch([request], phase), emits=[True])
     return scheduler._process_completed_batch(InFlightBatch(scheduled, output))
 
 
@@ -203,7 +220,7 @@ def test_ignored_eos_counts_toward_the_output_budget():
     assert deliver(scheduler, request, 99)[0].finish_reason is None
     request.advance_after_forward()
     assert deliver(scheduler, request, 99)[0].finish_reason == "length"
-    assert request.input_ids[-2:].tolist() == [99, 99]
+    assert request.input_ids[-2:] == [99, 99]
 
 
 def test_mixed_sampling_keeps_greedy_tied_maxima_deterministic(monkeypatch):
@@ -229,16 +246,76 @@ def test_mixed_sampling_keeps_greedy_tied_maxima_deterministic(monkeypatch):
 def test_aborted_inflight_request_does_not_reply_or_free_twice():
     request = make_request(output_len=5)
     scheduler = make_scheduler()
-    scheduler.running.add(request)
+    scheduler.running.append(request)
     request.advance_after_forward()
     scheduler._handle_message(AbortMsg(uid=request.uid))
     assert deliver(scheduler, request, 10) == []
     assert scheduler.free_rows == [0]
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_only_the_last_tp_rank_samples_and_every_rank_receives_its_tokens(monkeypatch, rank):
+    import minisgl.engine as engine
+
+    eng = object.__new__(engine.Engine)
+    eng.config = Config("unused", tp_info=DistributedInfo(rank, 2))
+    eng.device, eng.stream = torch.device("cpu"), "engine stream"
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "engine stream")
+    eng.graph_runner = SimpleNamespace(can_use_cuda_graph=lambda batch: False)
+    eng.model, eng.attn_backend = Mock(return_value=torch.zeros(1, 4)), None
+    sampler, broadcast = Mock(return_value=torch.tensor([3])), Mock()
+    monkeypatch.setattr(engine, "sample", sampler)
+    monkeypatch.setattr(engine, "broadcast", broadcast)
+    monkeypatch.setattr(torch.Tensor, "to", lambda self, *a, **kw: self)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: SimpleNamespace(record=lambda stream: None))
+    eng.forward_batch(Batch([make_request()], "decode"), None)
+    assert sampler.called == (rank == 1)
+    assert broadcast.call_args.kwargs["src"] == 1
+
+
 def test_empty_output_budget_is_rejected():
     with pytest.raises(ValueError, match="max_tokens"):
         SamplingParams(max_tokens=0)
+
+
+def test_trtllm_workspace_starts_with_zeroed_synchronization_counters(monkeypatch):
+    from minisgl.attention import TRTLLMBackend
+
+    empty = torch.empty
+
+    def dirty_empty(*args, **kwargs):
+        # Simulate recycled memory containing stale semaphore values.
+        return empty(*args, **kwargs).fill_(1)
+
+    monkeypatch.setattr(torch, "empty", dirty_empty)
+    backend = TRTLLMBackend(
+        SimpleNamespace(head_dim=64),
+        SimpleNamespace(device=torch.device("cpu")),
+        torch.zeros((1, 1), dtype=torch.int32),
+        page_size=64,
+    )
+    assert torch.count_nonzero(backend.workspace_buffer).item() == 0
+
+
+@pytest.mark.parametrize("ranks_per_gpu", [1, 2])
+def test_automatic_kv_sizing_shares_device_memory_once(ranks_per_gpu):
+    from minisgl.engine import Engine
+
+    config = Config("unused", tp_info=DistributedInfo(0, ranks_per_gpu), memory_ratio=0.9)
+    model = SimpleNamespace(head_dim=128, num_kv_heads=4, num_layers=48)
+    object.__setattr__(config, "model_config", model)
+    engine = object.__new__(Engine)
+    engine.ranks_per_gpu, engine.dtype = ranks_per_gpu, config.dtype
+    initial_free, current_free, activations = 94 << 30, 34 << 30, 1 << 30
+    engine._sync_get_memory = lambda: current_free
+
+    pages = engine._determine_num_pages(initial_free, activations, config)
+    page_bytes = 2 * 48 * (4 // ranks_per_gpu) * 128 * config.dtype.itemsize
+    # All ranks together must leave room for the ratio's headroom and each one's
+    # activation peak. The remaining capacity should miss that bound by <1 page/rank.
+    remaining = current_free - pages * page_bytes * ranks_per_gpu
+    reserved = (1 - config.memory_ratio) * initial_free + activations * ranks_per_gpu
+    assert 0 <= remaining - reserved < page_bytes * ranks_per_gpu
 
 
 def test_trtllm_decode_preserves_query_rows_from_a_fused_qkv_projection(monkeypatch):
@@ -350,17 +427,6 @@ def test_cancellation_caches_only_known_token_ids_and_returns_unknown_kv(cache):
 
 
 @torch.no_grad()
-def test_row_parallel_bias_is_added_after_all_reduce():
-    with patch("minisgl.layers.get_tp_info", return_value=DistributedInfo(0, 2)):
-        layer = RowParallelLinear(4, 3, has_bias=True)
-    layer.weight.fill_(1)
-    layer.bias.fill_(3)
-    with patch("minisgl.layers.all_reduce", side_effect=lambda x: 2 * x):
-        result = layer.forward(torch.ones(1, 2))
-    assert torch.equal(result, torch.full((1, 3), 7.0))
-
-
-@torch.no_grad()
 def test_vocabulary_gather_restores_batch_order_before_trimming_padding(monkeypatch):
     monkeypatch.setattr("minisgl.layers.get_tp_info", lambda: DistributedInfo(0, 2))
     head = ParallelLMHead(5, 2)
@@ -373,24 +439,13 @@ def test_vocabulary_gather_restores_batch_order_before_trimming_padding(monkeypa
     assert head(torch.ones(2, 2)).tolist() == [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]]
 
 
-@pytest.mark.parametrize("backend", ["single", "torch", "pynccl"])
-def test_collectives_preserve_single_rank_and_select_the_configured_transport(monkeypatch, backend):
+@pytest.mark.parametrize("size", [1, 2])
+def test_collectives_reduce_in_place_and_skip_a_single_rank(monkeypatch, size):
     import minisgl.distributed as distributed
 
-    size = 1 if backend == "single" else 2
     monkeypatch.setattr(distributed, "_TP_INFO", DistributedInfo(0, size))
-
-    def reduce(tensor, *args, **kwargs):
-        tensor.mul_(size)
-
-    def gather(output, tensor):
-        output.copy_(tensor.repeat(size, 1))
-
-    communicator = SimpleNamespace(
-        all_reduce=Mock(side_effect=reduce), all_gather=Mock(side_effect=gather)
-    )
-    monkeypatch.setattr(distributed, "_PYNCCL", communicator if backend == "pynccl" else None)
-    torch_reduce, torch_gather = Mock(side_effect=reduce), Mock(side_effect=gather)
+    torch_reduce = Mock(side_effect=lambda tensor: tensor.mul_(size))
+    torch_gather = Mock(side_effect=lambda output, tensor: output.copy_(tensor.repeat(size, 1)))
     monkeypatch.setattr(torch.distributed, "all_reduce", torch_reduce)
     monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", torch_gather)
 
@@ -398,33 +453,106 @@ def test_collectives_preserve_single_rank_and_select_the_configured_transport(mo
     assert distributed.all_reduce(value) is value
     assert torch.equal(value, torch.full((2, 3), float(size)))
     assert torch.equal(distributed.all_gather(value), value.repeat(size, 1))
-    if backend == "pynccl":
-        communicator.all_reduce.assert_called_once()
-        communicator.all_gather.assert_called_once()
-        torch_reduce.assert_not_called()
-        torch_gather.assert_not_called()
-    elif backend == "torch":
-        torch_reduce.assert_called_once()
-        torch_gather.assert_called_once()
-    else:
-        torch_reduce.assert_not_called()
-        torch_gather.assert_not_called()
+    assert torch_reduce.called == torch_gather.called == (size > 1)
 
 
-def test_uneven_vocabulary_shards_have_matching_padded_shapes():
-    weights = torch.arange(10).view(5, 2)
-    shards = [_shard_tensor("lm_head.weight", weights, rank, 2, 1) for rank in range(2)]
-    assert [tuple(shard.shape) for shard in shards] == [(3, 2), (3, 2)]
+def test_uneven_vocabulary_shards_are_padded_with_zero_rows(monkeypatch):
+    from minisgl.layers import load_vocab_shard
+
+    weights = torch.arange(10.0).view(5, 2)
+    shards = []
+    for rank in range(2):
+        monkeypatch.setattr(
+            "minisgl.layers.get_tp_info", lambda rank=rank: DistributedInfo(rank, 2)
+        )
+        param = torch.nn.Parameter(torch.full((3, 2), -1.0))
+        assert load_vocab_shard(param, weights) == param.numel()
+        shards.append(param.data)
     assert torch.equal(torch.cat(shards)[:5], weights)
-    assert torch.equal(shards[-1][-1], torch.zeros(2, dtype=weights.dtype))
+    assert torch.equal(shards[-1][-1], torch.zeros(2))
 
 
-def test_kv_head_replication_keeps_adjacent_ranks_on_the_same_head():
-    weights = torch.arange(16).view(8, 2)
+def test_packed_loaders_place_each_rank_shard(monkeypatch):
+    from minisgl.models import GatedFeedForward, RotaryAttention
+
+    config = SimpleNamespace(
+        num_qo_heads=8, num_kv_heads=4, head_dim=2, hidden_size=4, intermediate_size=4,
+        hidden_act="silu", rms_norm_eps=1e-6,
+    )  # fmt: skip
+    k_proj = torch.arange(32.0).view(8, 4)  # Four KV heads of two rows each.
+    gate, up = torch.arange(16.0).view(4, 4), -torch.arange(16.0).view(4, 4)
     for rank in range(8):
-        shard = _shard_tensor("self_attn.k_proj.weight", weights, rank, 8, 4)
-        head = rank // 2
-        assert torch.equal(shard, weights[2 * head : 2 * head + 2])
+        monkeypatch.setattr("minisgl.distributed._TP_INFO", DistributedInfo(rank, 8))
+        attention = RotaryAttention(config, 0, attention_bias=False, qk_norm=False)
+        weight = attention.qkv_proj.weight  # [Q 2 | K 2 | V 2] rows: one head each.
+        weight.weight_loader(weight, k_proj, "k")
+        head = rank // 2  # Eight ranks share four KV heads: adjacent ranks replicate one.
+        assert torch.equal(weight.data[2:4], k_proj[2 * head : 2 * head + 2])
+    monkeypatch.setattr("minisgl.distributed._TP_INFO", DistributedInfo(1, 2))
+    mlp = GatedFeedForward(config)
+    weight = mlp.gate_up_proj.weight  # [local gate 2 | local up 2] rows on rank 1.
+    weight.weight_loader(weight, gate, 0)
+    weight.weight_loader(weight, up, 1)
+    assert torch.equal(weight.data, torch.cat([gate[2:], up[2:]]))
+
+
+def _tiny_llama(tie):
+    return SimpleNamespace(
+        architecture="LlamaForCausalLM", num_layers=1, vocab_size=8, hidden_size=4,
+        intermediate_size=8, num_qo_heads=2, num_kv_heads=1, head_dim=2, rms_norm_eps=1e-6,
+        hidden_act="silu", tie_word_embeddings=tie, num_experts=0, num_experts_per_tok=0,
+        moe_intermediate_size=0, norm_topk_prob=False,
+    )  # fmt: skip
+
+
+def _llama_checkpoint(tie):
+    tensors = {
+        "model.embed_tokens.weight": torch.randn(8, 4),
+        "model.norm.weight": torch.randn(4),
+        "model.layers.0.input_layernorm.weight": torch.randn(4),
+        "model.layers.0.post_attention_layernorm.weight": torch.randn(4),
+        "model.layers.0.self_attn.q_proj.weight": torch.randn(4, 4),
+        "model.layers.0.self_attn.k_proj.weight": torch.randn(2, 4),
+        "model.layers.0.self_attn.v_proj.weight": torch.randn(2, 4),
+        "model.layers.0.self_attn.o_proj.weight": torch.randn(4, 4),
+        "model.layers.0.mlp.gate_proj.weight": torch.randn(8, 4),
+        "model.layers.0.mlp.up_proj.weight": torch.randn(8, 4),
+        "model.layers.0.mlp.down_proj.weight": torch.randn(4, 8),
+    }
+    if not tie:
+        tensors["lm_head.weight"] = torch.randn(8, 4)
+    return tensors
+
+
+@pytest.mark.parametrize("tie", [True, False])
+def test_weight_loading_fills_every_parameter_or_fails(monkeypatch, tmp_path, tie):
+    from safetensors.torch import save_file
+
+    monkeypatch.setattr("minisgl.distributed._TP_INFO", DistributedInfo(0, 1))
+    monkeypatch.setattr("minisgl.models.RotaryEmbedding", lambda config: None)
+    tensors = _llama_checkpoint(tie)
+    save_file(tensors, tmp_path / "model.safetensors")
+    model = create_model(_tiny_llama(tie))
+    load_weights(model, str(tmp_path), _tiny_llama(tie), DistributedInfo(0, 1))
+    head = tensors["model.embed_tokens.weight" if tie else "lm_head.weight"]
+    assert torch.equal(model.lm_head.weight, head)
+    assert (model.lm_head.weight is model.model.embed_tokens.weight) == tie
+    packed = model.model.layers[0].self_attn.qkv_proj.weight
+    assert torch.equal(packed[4:6], tensors["model.layers.0.self_attn.k_proj.weight"])
+
+    def load():
+        model = create_model(_tiny_llama(tie))
+        load_weights(model, str(tmp_path), _tiny_llama(tie), DistributedInfo(0, 1))
+
+    gate = "model.layers.0.mlp.gate_proj.weight"
+    del tensors["model.layers.0.mlp.up_proj.weight"]  # Half of gate_up stays unloaded.
+    save_file(tensors, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="did not fill"):
+        load()
+    # A repeated gate slice in another file must not stand in for the missing up slice.
+    save_file({gate: tensors[gate]}, tmp_path / "model-extra.safetensors")
+    with pytest.raises(ValueError, match="loaded twice"):
+        load()
 
 
 def test_terminal_reply_releases_frontend_state_before_consumer_breaks():
@@ -615,11 +743,8 @@ def test_worker_crash_in_an_open_stream_is_a_server_error():
     asyncio.run(check())
 
 
-@pytest.mark.parametrize(
-    "path,stream",
-    [("/v1/chat/completions", False), ("/v1/chat/completions", True), ("/generate", True)],
-)
-def test_late_http_requests_get_503_before_any_stream_headers(path, stream):
+@pytest.mark.parametrize("stream", [False, True])
+def test_late_http_requests_get_503_before_any_stream_headers(stream):
     import json
 
     async def check():
@@ -643,7 +768,7 @@ def test_late_http_requests_get_503_before_any_stream_headers(path, stream):
             "type": "http",
             "http_version": "1.1",
             "method": "POST",
-            "path": path,
+            "path": "/v1/chat/completions",
             "query_string": b"",
             "headers": [(b"content-type", b"application/json")],
             "scheme": "http",
@@ -696,7 +821,7 @@ def test_chat_template_token_ids_are_not_tokenized_twice():
     tokenizer.apply_chat_template.return_value = [1, 2, 3]
     text = [{"role": "user", "content": "hello"}]
     ids = tokenize(tokenizer, TokenizeMsg(0, text, SamplingParams()))
-    assert ids.dtype == torch.int32 and ids.tolist() == [1, 2, 3]
+    assert ids == [1, 2, 3]
     tokenizer.apply_chat_template.assert_called_once_with(
         text, tokenize=True, add_generation_prompt=True
     )
@@ -723,7 +848,7 @@ def test_bad_chat_does_not_kill_the_shared_tokenizer_worker(monkeypatch):
     error = frontend.put.call_args.args[0].data[0]
     assert error.uid == 0 and "invalid roles" in error.error
     request = backend.put.call_args.args[0].data[0]
-    assert request.uid == 1 and request.input_ids.tolist() == [7]
+    assert request.uid == 1 and request.input_ids == [7]
     for socket in (receiver, backend, frontend):
         socket.stop.assert_called_once()
 
@@ -753,32 +878,6 @@ def test_final_token_flushes_text_held_for_an_incomplete_character():
     assert decoder.detokenize([DetokenizeMsg(0, 1, False)]) == ["ab"]
     assert decoder.detokenize([DetokenizeMsg(0, 2, True, "length")]) == [" cd�"]
     assert decoder.decode_map == {}
-
-
-def test_benchmark_starts_before_headers_and_ignores_control_chunks(monkeypatch):
-    from minisgl.benchmark import benchmark_one
-
-    ticks, seen = iter([1.0, 2.0, 3.0]), []
-
-    def clock():
-        value = next(ticks)
-        seen.append(value)
-        return value
-
-    monkeypatch.setattr("minisgl.benchmark.time.perf_counter", clock)
-
-    async def response():
-        for content in [None, "", "hello", " world", None]:
-            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
-
-    async def create(**kwargs):
-        assert seen == [1.0]  # The HTTP wait belongs inside request latency.
-        return response()
-
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    timing = asyncio.run(benchmark_one(client, "hello", 8, "model"))
-    assert (timing.started, timing.first_text, timing.finished) == (1.0, 2.0, 3.0)
-    assert timing.requested_output_tokens == 8
 
 
 def test_offline_api_rejects_mismatched_prompt_and_parameter_counts():
@@ -836,11 +935,13 @@ def test_corrupt_legacy_chat_template_is_not_silently_ignored(monkeypatch, tmp_p
 
 @pytest.mark.parametrize("limit,expected", [(0, []), (1, [1]), (3, [1, 2]), (8, [1, 2, 4, 8])])
 def test_cuda_graph_sizes_respect_the_requested_limit(limit, expected):
-    assert _determine_cuda_graph_bs(None, limit, 96 << 30, 256) == expected
+    assert cuda_graph_sizes(limit) == expected
 
 
-def test_cuda_graphs_stop_at_the_largest_possible_batch():
-    assert _determine_cuda_graph_bs(None, None, 96 << 30, 8) == [1, 2, 4, 8]
+def test_cuda_graphs_stop_at_the_largest_possible_batch(monkeypatch):
+    monkeypatch.setattr(GraphRunner, "_capture_graphs", lambda *args: None)
+    runner = GraphRunner(None, None, None, None, None, 8, 64, 10, None)
+    assert runner.graph_bs_list == [1, 2, 4, 8]
 
 
 @pytest.mark.parametrize(
@@ -856,7 +957,7 @@ def test_cuda_graphs_stop_at_the_largest_possible_batch():
 )
 def test_shared_decoder_preserves_checkpoint_keys_and_shapes(monkeypatch, architecture):
     monkeypatch.setattr("minisgl.distributed._TP_INFO", DistributedInfo(0, 1))
-    monkeypatch.setattr("minisgl.models.create_rope", lambda *args: None)
+    monkeypatch.setattr("minisgl.models.RotaryEmbedding", lambda config: None)
     config = SimpleNamespace(
         architecture=architecture,
         num_layers=2,

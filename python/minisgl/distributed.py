@@ -1,4 +1,8 @@
-"""Rank information and GPU communication for tensor and pipeline parallelism."""
+"""Rank information and GPU communication for tensor and pipeline parallelism.
+
+Every collective is a plain torch.distributed call on the NCCL backend. PyTorch
+supports capturing these calls, so decode CUDA graphs record them like kernels.
+"""
 
 from __future__ import annotations
 
@@ -20,12 +24,13 @@ class DistributedInfo:
         return self.rank == 0
 
 
-_TP_INFO: DistributedInfo | None = None
+_TP_INFO: DistributedInfo | None = None  # Shards each layer; trivial under PP.
+_WORLD_INFO: DistributedInfo | None = None  # Every rank in the job, TP or PP.
 
 
-def set_tp_info(rank: int, size: int) -> None:
-    global _TP_INFO
-    _TP_INFO = DistributedInfo(rank, size)
+def set_parallel_info(tp: DistributedInfo, world: DistributedInfo) -> None:
+    global _TP_INFO, _WORLD_INFO
+    _TP_INFO, _WORLD_INFO = tp, world
 
 
 def get_tp_info() -> DistributedInfo:
@@ -34,20 +39,15 @@ def get_tp_info() -> DistributedInfo:
     return _TP_INFO
 
 
-def try_get_tp_info() -> DistributedInfo | None:
-    return _TP_INFO
-
-
-_PYNCCL = None
+def get_world_info() -> DistributedInfo:
+    """This process among all ranks; a lone process before an engine starts."""
+    return _WORLD_INFO or DistributedInfo(0, 1)
 
 
 def all_reduce(x: torch.Tensor) -> torch.Tensor:
-    """Sum tensor-parallel partial results in place, using PyNCCL or PyTorch."""
+    """Sum tensor-parallel partial results in place."""
     if get_tp_info().size > 1:
-        if _PYNCCL is not None:
-            _PYNCCL.all_reduce(x, "sum")
-        else:
-            dist.all_reduce(x, op=dist.ReduceOp.SUM)
+        dist.all_reduce(x)
     return x
 
 
@@ -57,10 +57,7 @@ def all_gather(x: torch.Tensor) -> torch.Tensor:
     if tp_size == 1:
         return x
     output = x.new_empty((x.shape[0] * tp_size, *x.shape[1:]))
-    if _PYNCCL is not None:
-        _PYNCCL.all_gather(output, x)
-    else:
-        dist.all_gather_into_tensor(output, x)
+    dist.all_gather_into_tensor(output, x)
     return output
 
 
@@ -72,36 +69,19 @@ def stage_layers(num_layers: int, pp: DistributedInfo) -> range:
     return range(start, start + base + (pp.rank < extra))
 
 
-# Pipeline stages use PyNCCL alone: it enqueues on the current CUDA stream, which
-# lets graphs capture these calls. Config rejects PP without it.
 def send(x: torch.Tensor, dst: int) -> None:
-    _PYNCCL.send(x, dst)
+    dist.send(x, dst)
 
 
 def recv(x: torch.Tensor, src: int) -> None:
-    _PYNCCL.recv(x, src)
+    dist.recv(x, src)
 
 
 def broadcast(x: torch.Tensor, src: int) -> None:
-    _PYNCCL.broadcast(x, src)
-
-
-def enable_pynccl_distributed(
-    world: DistributedInfo, cpu_group: torch.distributed.ProcessGroup, max_bytes: int
-) -> None:
-    global _PYNCCL
-    if world.size > 1:
-        from minisgl.kernel import init_pynccl
-
-        _PYNCCL = init_pynccl(
-            tp_rank=world.rank,
-            tp_size=world.size,
-            tp_cpu_group=cpu_group,
-            max_size_bytes=max_bytes,
-        )
+    """Copy src's tensor to every rank."""
+    dist.broadcast(x, src)
 
 
 def destroy_distributed() -> None:
-    global _PYNCCL, _TP_INFO
-    _PYNCCL = None
-    _TP_INFO = None
+    global _TP_INFO, _WORLD_INFO
+    _TP_INFO = _WORLD_INFO = None

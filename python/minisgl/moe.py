@@ -9,6 +9,9 @@ size, and H the hidden size. Equivalent to this loop, which is too slow to run:
 Instead, sort the T * k routes by expert, then run one matmul per expert block:
 
     x [T, H] -> gate_up [T, k, 2 * I] -> activated [T * k, I] -> output [T, k, H] -> sum [T, H]
+
+sgl-kernel routes and sorts; the Triton grouped matmul at the end of this file
+multiplies each block of routes by its expert's weights.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import triton
+import triton.language as tl
 from minisgl.utils import div_ceil
 
 
@@ -33,10 +38,6 @@ def fused_moe_kernel_triton(
     config: dict[str, Any],
     compute_type: torch.dtype,
 ) -> None:
-    import triton
-    import triton.language as tl
-    from minisgl.moe_kernel import fused_moe_kernel
-
     # C[route] = A[route] @ B[expert].T, for each route in sorted_token_ids.
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -71,41 +72,6 @@ def fused_moe_kernel_triton(
         compute_type=dtype,  # type: ignore
         even_Ks=even_Ks,  # type: ignore
         **config,
-    )
-
-
-def moe_sum_reduce_triton(input: torch.Tensor, output: torch.Tensor) -> None:
-    import triton
-    from minisgl.moe_kernel import moe_sum_reduce_kernel
-
-    assert input.is_contiguous()
-    assert output.is_contiguous()
-
-    token_num, topk_num, hidden_dim = input.shape
-    assert output.shape[0] == token_num and output.shape[1] == hidden_dim
-
-    BLOCK_M = 1
-    BLOCK_DIM = 2048
-    NUM_STAGE = 1
-    num_warps = 8
-
-    grid = (
-        triton.cdiv(token_num, BLOCK_M),
-        triton.cdiv(hidden_dim, BLOCK_DIM),
-    )
-
-    moe_sum_reduce_kernel[grid](
-        input,
-        *input.stride(),
-        output,  # type: ignore
-        *output.stride(),
-        token_num=token_num,
-        topk_num=topk_num,
-        hidden_dim=hidden_dim,
-        BLOCK_M=BLOCK_M,
-        BLOCK_DIM=BLOCK_DIM,
-        NUM_STAGE=NUM_STAGE,
-        num_warps=num_warps,  # type: ignore
     )
 
 
@@ -235,11 +201,8 @@ def fused_experts_impl(
         compute_type=compute_type,
     )
 
-    moe_sum_reduce_triton(
-        expert_output,
-        hidden_states,
-    )
-    return hidden_states
+    # Sum each token's k weighted expert outputs: [T, k, H] -> [T, H].
+    return torch.sum(expert_output, dim=1, out=hidden_states)
 
 
 def fused_moe(
@@ -257,3 +220,123 @@ def fused_moe(
         renormalize=renormalize,
     )
     return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids)
+
+
+@triton.jit
+def fused_moe_kernel(
+    # Pointers to matrices
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Matrix dimensions
+    N,
+    K,
+    EM,
+    num_valid_tokens,
+    # The stride variables represent how much to increase the ptr by when
+    # moving by 1 element in a particular dimension. E.g. `stride_am` is
+    # how much to increase `a_ptr` by to get the element one row down
+    # (A has M rows).
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    # Meta-parameters
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    even_Ks: tl.constexpr,
+):
+    """Grouped GEMM: A[tokens, K] and B[experts, N, K] -> C[tokens, topk, N].
+
+    Each program handles a block of token/expert routes for one expert.
+    First GEMM: route_id // top_k selects the original token. After activation,
+    inputs are expanded per route, so the second GEMM uses top_k=1. Padding
+    routes are masked; output indices always refer to the original route order.
+    """
+    # Map program ids `pid` to the block of C it should compute.
+    # This is done in a grouped ordering to promote L2 data reuse.
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Create pointers for the first blocks of A and B.
+    # We will advance this pointer as we move in the K direction
+    # and accumulate
+    # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
+    # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    offs_token = offs_token.to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak)
+
+    off_experts = tl.load(expert_ids_ptr + pid_m)
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    )
+
+    # Iterate to compute a block of the C matrix.
+    # We accumulate into a `[BLOCK_SIZE_M, BLOCK_SIZE_N]` block
+    # of fp32 values for higher accuracy.
+    # `accumulator` will be converted back to fp16 after the loop.
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load the next block of A and B, generate a mask by checking the
+        # K dimension.
+        if even_Ks:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None],
+                other=0.0,
+            )
+            b = tl.load(b_ptrs)
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+            b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+
+        accumulator += tl.dot(a, b)
+        # Advance the ptrs to the next K block.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    # Write back the block of the output
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)

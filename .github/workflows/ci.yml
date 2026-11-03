@@ -1,0 +1,26 @@
+# Lint and the CPU test suite. GPU checks (tests/smoke.py, tests/parity.py) need
+# an NVIDIA GPU and run by hand; see the README.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        # The CUDA wheel, as users install it, runs these tests without a GPU; the
+        # CPU wheel lacks the NVTX profiler ranges the model is annotated with.
+        run: |
+          uv venv --python 3.12
+          uv pip install -e '.[dev]' -c constraints.txt --torch-backend cu128
+      - name: Lint
+        run: |
+          .venv/bin/ruff check .
+          .venv/bin/ruff format --check .
+      - name: CPU tests
+        run: .venv/bin/python -m pytest -q

@@ -166,7 +166,8 @@ def dump_minisgl(model_path, prompts, dtype, continuations=None, **settings) -> 
             for prompt, forced in zip(prompts, continuations, strict=True):
                 prompt_scores.clear(), output_scores.clear()
                 llm.generate([prompt], SamplingParams(max_tokens=len(forced), ignore_eos=True))
-                if model.lm_head is None:  # Only the final pipeline stage has scores.
+                world = llm.scheduler.engine.config.world
+                if world.rank != world.size - 1:  # Only the last rank samples and scores.
                     continue
                 if len(prompt_scores) != len(prompt) - 1 or len(output_scores) != len(forced):
                     raise ValueError(
@@ -190,7 +191,7 @@ def _minisgl_rank(rank, size, kind, model_path, prompts, dtype, continuations, s
         **{f"{kind}_info": DistributedInfo(rank, size)},
         **settings,
     )
-    if rank == (size - 1 if kind == "pp" else 0):
+    if rank == size - 1:  # The sampling rank; see Engine.forward_batch.
         results.put(report)
 
 

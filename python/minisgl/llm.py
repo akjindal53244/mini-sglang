@@ -39,9 +39,8 @@ class LLM:
                 prompt = prompts[next_prompt]
                 if isinstance(prompt, str):
                     prompt = self.tokenizer.encode(prompt)
-                ids = torch.tensor(prompt, dtype=torch.int32, device="cpu")
-                input_tokens += len(ids)
-                messages.append(UserMsg(next_prompt, ids, sampling_params[next_prompt]))
+                input_tokens += len(prompt)
+                messages.append(UserMsg(next_prompt, list(prompt), sampling_params[next_prompt]))
                 next_prompt += 1
             for reply in self.scheduler.step(messages):
                 if isinstance(reply, ErrorMsg):

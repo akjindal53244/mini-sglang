@@ -25,24 +25,25 @@ from minisgl.message import (
 class NestedPayload:
     value: int
     children: list[NestedPayload]
-    tokens: torch.Tensor
+    tokens: list[int]
 
 
-def test_nested_tensor_round_trip():
-    tokens = torch.tensor([1, 2, 3], dtype=torch.int32)
-    payload = NestedPayload(10, [NestedPayload(20, [], tokens)], tokens)
+def test_nested_dataclass_round_trip():
+    payload = NestedPayload(10, [NestedPayload(20, [], [1, 2])], [3])
     decoded = deserialize_type({"NestedPayload": NestedPayload}, serialize_type(payload))
-    assert decoded.value == 10 and decoded.children[0].value == 20
-    assert torch.equal(decoded.tokens, tokens)
-    assert torch.equal(decoded.children[0].tokens, tokens)
-    assert decoded.tokens.dtype == torch.int32
+    assert decoded == payload
+
+
+def test_tensors_are_rejected_instead_of_silently_serialized():
+    with pytest.raises(TypeError, match="Tensor"):
+        serialize_type(UserMsg(1, torch.tensor([1, 2]), SamplingParams()))
 
 
 @pytest.mark.parametrize(
     "message",
     [
-        UserMsg(1, torch.tensor([1, 2], dtype=torch.int32), SamplingParams()),
-        BatchMsg([UserMsg(1, torch.tensor([3], dtype=torch.int32), SamplingParams())]),
+        UserMsg(1, [1, 2], SamplingParams()),
+        BatchMsg([UserMsg(1, [3], SamplingParams())]),
         TokenizeMsg(1, [{"role": "user", "content": "hello"}], SamplingParams()),
         UserReply(1, "hello", True),
         DetokenizeMsg(1, 42, False),
@@ -60,7 +61,7 @@ def test_wire_message_round_trip(message):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_queue_preserves_nested_message_and_tensor_values(tmp_path, asynchronous):
+def test_queue_preserves_nested_messages(tmp_path, asynchronous):
     import asyncio
 
     import zmq
@@ -71,7 +72,7 @@ def test_queue_preserves_nested_message_and_tensor_values(tmp_path, asynchronous
     sender = queue_type(address, zmq.PUSH)
     sender.socket.setsockopt(zmq.SNDTIMEO, 2000)
     receiver.socket.setsockopt(zmq.RCVTIMEO, 2000)
-    message = BatchMsg([UserMsg(7, torch.tensor([2, 3], dtype=torch.int32), SamplingParams())])
+    message = BatchMsg([UserMsg(7, [2, 3], SamplingParams())])
 
     async def exchange():
         await sender.put(message)

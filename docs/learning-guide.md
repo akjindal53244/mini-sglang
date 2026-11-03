@@ -6,7 +6,7 @@ The [README](../README.md) contains installation and runnable examples.
 
 ## Reading order
 
-The package is flat: all 20 Python files live in `python/minisgl/`. There are no
+The package is flat: all 17 Python files live in `python/minisgl/`. There are no
 model registries, custom module frameworks, global batch contexts, or scheduler
 manager hierarchies. Each file owns one mechanism or a small group used together.
 
@@ -18,32 +18,31 @@ manager hierarchies. Each file owns one mechanism or a small group used together
 | 4 | [llm.py](../python/minisgl/llm.py) | Offline tokenization, scheduler loop, output collection |
 | 5 | [scheduler.py](../python/minisgl/scheduler.py) | Admission, prefill/decode selection, overlap, completion |
 | 6 | [engine.py](../python/minisgl/engine.py) | GPU setup, weights, model execution, sampling, D2H copy |
-| 7 | [kvcache.py](../python/minisgl/kvcache.py) | KV tensors, physical pages, radix prefixes, locks, eviction |
+| 7 | [kvcache.py](../python/minisgl/kvcache.py) | KV tensors and their Triton store, physical pages, radix prefixes, locks, eviction |
 | 8 | [attention.py](../python/minisgl/attention.py) | Kernel calls and phase-specific attention metadata |
 | 9 | [graph.py](../python/minisgl/graph.py) | Decode capture/replay, persistent buffers, padding |
 | 10 | [distributed.py](../python/minisgl/distributed.py) | Rank information, GPU collectives, pipeline stages |
-| 11 | [server.py](../python/minisgl/server.py) | HTTP/shell, worker lifecycle, TP request broadcast |
+| 11 | [server.py](../python/minisgl/server.py) | HTTP/shell, worker lifecycle, request broadcast to ranks |
 | 12 | [tokenizer.py](../python/minisgl/tokenizer.py) | Chat templates, encoding, incremental text decoding |
 | 13 | [message.py](../python/minisgl/message.py) | CPU messages, MessagePack, ZeroMQ sockets |
 | 14 | [config.py](../python/minisgl/config.py) | One runtime Config, normalized ModelConfig, CLI |
-| 15 | [kernel.py](../python/minisgl/kernel.py) | Lazy C++/CUDA bindings for gather/store/radix/NCCL |
-| 16 | [moe.py](../python/minisgl/moe.py) | Routing and grouped expert matmul launches |
-| 17 | [moe_kernel.py](../python/minisgl/moe_kernel.py) | Triton expert matmul and reduction |
-| 18 | [utils.py](../python/minisgl/utils.py) | Shape arithmetic, Hub loading, logging, memory helpers |
-| 19 | [__main__.py](../python/minisgl/__main__.py) | CLI entry point |
-| Optional | [benchmark.py](../python/minisgl/benchmark.py) | HTTP timings and CUDA kernel measurements |
+| 15 | [moe.py](../python/minisgl/moe.py) | Routing, the Triton grouped expert matmul, and the weighted sum |
+| 16 | [utils.py](../python/minisgl/utils.py) | Shape arithmetic, Hub loading, logging |
+| 17 | [__main__.py](../python/minisgl/__main__.py) | CLI entry point |
 
-The native sources are in `python/minisgl/csrc/`. They implement embedding
-lookup, KV writes, CPU prefix comparison, and the small PyNCCL binding. The
-vendored NCCL header is API declaration material, not another serving framework.
+There is no native code. GPU collectives are `torch.distributed` calls on NCCL,
+embedding lookup is `F.embedding`, prefix comparison is numpy, and the KV write
+is a 15-line Triton kernel. Each matched the custom CUDA code it replaced, bit
+for bit. Inside decode graphs the Triton store takes about 1 µs per layer here,
+versus about 4 µs for PyTorch indexing.
 
 ## Start with the transformer
 
 `DecoderForCausalLM` is a normal `torch.nn.Module`: an embedding, a `ModuleList`
 of pre-norm decoder blocks, a final RMSNorm, and an LM head. `create_model` selects
-architecture options, sets eval mode, and disables gradients. Weights are built
-on `meta`, then assigned from the checkpoint; initialization never allocates
-random GPU parameters. One FP32 RoPE table is shared by all layers.
+architecture options, sets eval mode, and disables gradients. Parameters are
+allocated on the GPU, then overwritten from the checkpoint. One FP32 RoPE table
+is shared by all layers.
 
 For T newly processed tokens and H hidden features:
 
@@ -51,7 +50,7 @@ For T newly processed tokens and H hidden features:
 input_ids [T] -> embedding [T,H]
   -> residual RMSNorm -> QKV projection -> optional Q/K norm -> RoPE
   -> write K/V -> causal attention -> output projection
-  -> residual RMSNorm -> gate/up -> activation(gate) * up -> down
+  -> residual RMSNorm -> gate/up -> silu(gate) * up -> down
   -> repeat layers -> residual RMSNorm -> selected states -> vocabulary logits
 ```
 
@@ -74,14 +73,20 @@ rewriting the block as separate additions and normalizations.
 
 This table describes implemented paths, not blanket support for every model
 using those family names. Sliding windows, alternative norms/activations, vision,
-and new recurrent blocks need explicit implementation and validation.
+and new recurrent blocks need explicit implementation and validation. A config
+whose sliding window is shorter than its context is rejected: both attention
+kernels would silently attend to the whole prefix.
 
 Checkpoint keys follow ordinary module attribute names. Renaming `qkv_proj`,
-`model`, or `layers` changes loading; renaming a local variable does not. The
-loader shards individual Q/K/V and gate/up weights **before** concatenating them.
-Splitting an already packed QKV tensor into equal pieces gives ranks the wrong
-heads. Expert tensors are stacked in expert-index order. For tied vocabulary
-weights, `load_state_dict(assign=True)` lets embedding and head share storage.
+`model`, or `layers` changes loading; renaming a local variable does not. A packed
+or sharded parameter carries a `weight_loader` that copies its part of a checkpoint
+tensor into place, so the layer that knows a layout also loads it. Q, K, and V are
+each sharded **before** landing in `qkv_proj`: splitting the packed tensor into
+equal pieces would give ranks the wrong heads. A tied head *is* the embedding
+parameter, loaded once. Loading fails unless every element of every parameter
+was written, so a missing checkpoint tensor cannot leave random weights behind.
+It also fails on a repeated tensor, which could otherwise stand in for a missing
+slice of the same size.
 
 ## Trace one message to a response
 
@@ -114,8 +119,8 @@ For a live walkthrough, stop in these functions in order:
 1. `tokenizer.tokenize`: apply the chat template directly to IDs. Rendering to a
    string and encoding with special tokens again can duplicate BOS.
 2. `Scheduler._handle_message`: check the context limit and queue the request.
-3. `_prefill_batch`: match a prefix, lock it, reserve capacity, stage a prompt chunk.
-4. `_prepare_batch`: allocate pages, gather token positions, prepare kernel metadata.
+3. `_prefill_batch`: match a prefix, lock it, reserve capacity, choose a prompt chunk.
+4. `_prepare_batch`: allocate pages, build input IDs and positions, prepare kernel metadata.
 5. `Engine.forward_batch`: run the model or graph, sample, enqueue the CPU copy.
 6. `_process_completed_batch`: wait for that copy, append the ID, finish or continue.
 7. `DetokenizeManager.detokenize`: turn overlapping token context into new text.
@@ -156,10 +161,11 @@ visibility. With overlap, the following forward may already be queued when the
 previous ID arrives on CPU. Only **delivered** tokens exhaust the output budget.
 
 Chunked prefill uses a fixed token budget per batch. A seven-token prompt with
-budget three runs chunks of 3, 3, and 1. Each chunk has a separate `Request`
-record, but reuses the row, prefix lock, and KV. The immutable `is_prefill_chunk`
-flag ensures a delayed result from an intermediate chunk never emits a token.
-The sampled ID from such a chunk is discarded; the next input is prompt text.
+budget three runs chunks of 3, 3, and 1, all in one `Request` that keeps its row,
+prefix lock, and KV. A chunk's sampled ID is discarded; the next input is prompt
+text. With overlap, a batch is retired one step late, when its request may already
+be on the next chunk. So `ScheduledBatch.emits` records, at scheduling time, which
+rows produce output; reading the request's current state would emit chunk tokens.
 Prefill has priority over decode in this scheduler; it does not implement a more
 elaborate fairness policy or mixed prefill/decode batches.
 
@@ -167,7 +173,7 @@ elaborate fairness policy or mixed prefill/decode batches.
 
 | Structure | Index | Stored value |
 |---|---|---|
-| `token_pool` | Request row, logical position | GPU token ID |
+| `next_tokens` | Request row | Latest sampled token ID, the next decode's input |
 | `page_table` | Request row, logical position | Physical KV token slot |
 | KV pool | K/V, layer, page, token, local KV head, feature | K or V vector |
 | `free_pages` | Free-page entry | Page-aligned physical token offset |
@@ -177,6 +183,15 @@ For page size four, free entries `[0,4,8]` describe three pages. The middle page
 contains slots `[4,5,6,7]`. Admission reserves **whole pages** through the future
 KV length, not just the count of requested tokens. Otherwise many one-token
 requests can appear to fit while exhausting the actual page pool.
+
+The pool's size is decided last. After loading weights, `Engine` runs the largest
+prefill batch the scheduler can form, then samples from it, on a small temporary
+pool, and measures peak memory. That batch spreads the whole prefill budget over
+every request row: several short prompts can fill the budget when one prompt,
+capped by the context length, cannot, and each row adds a vocabulary-sized logit
+row. KV then gets `memory_ratio` of free memory minus weights, workspaces, and
+that peak. Ranks sharing one GPU split both that budget and the device-wide usage
+they measure. Reserving whole requests up front means no request is ever preempted.
 
 KV bytes per token on one rank are:
 
@@ -206,17 +221,19 @@ logits: one prompt token must still run to produce the next-token distribution.
 
 With `overlap=False`, one `Scheduler.step` submits a forward and consumes its
 CPU result. With overlap, it submits the current forward before consuming the
-previous result. GPU token IDs feed the next step directly from `token_pool`,
-without waiting for CPU detokenization.
+previous result. Prefill reads prompt IDs from CPU lists. Decode reads each row's
+latest sample from `next_tokens` on the GPU, without waiting for the CPU copy.
 
 ```
 CPU:   prepare batch N -> submit N -> retire CPU result N-1 -> prepare N+1
 GPU:         forward N-1 -> sample/copy -> forward N -> sample/copy
 ```
 
-The metadata and engine CUDA streams have explicit dependencies before consuming
-new indices or reusing rows. `ScheduledBatch` retains index/sampling tensors
-until the corresponding work finishes. FlashInfer also reuses pinned host
+Batch metadata is built on a separate CUDA stream, and the engine stream waits
+for it before each forward. The reverse wait is unnecessary: a forward reads only
+its own copies of page-table rows, and `next_tokens` is read and written only on
+the engine stream. `ScheduledBatch` retains index/sampling tensors until the
+corresponding work finishes. FlashInfer also reuses pinned host
 planning buffers: its event guard prevents a new plan from overwriting memory
 still being copied asynchronously. Removing that wait can corrupt metadata
 without a Python exception.
@@ -251,17 +268,18 @@ kernel changes.
 ## Add tensor parallelism, pipeline parallelism, and experts
 
 Column-parallel QKV and gate/up projections shard output features. Row-parallel
-output/down projections compute partial hidden states and sum them. A bias on a
-row-parallel projection must be added **after** the sum. When TP exceeds KV heads,
+output/down projections compute partial hidden states and sum them. When TP exceeds KV heads,
 adjacent ranks replicate a head. Vocabulary projection all-gather returns
 `[rank,token,local_vocab]`; permute to `[token,rank,local_vocab]` before flattening
 and trimming padded vocabulary rows.
 
 `server._receive_requests` uses Gloo to distribute the same ordered request
-packets to all ranks. Decode requests are sorted by UID, since Python set order
-can differ between processes. GPU all-reduce/all-gather use the small PyNCCL
-binding by default, or PyTorch NCCL with `--disable-pynccl`. A single GPU needs
-neither a process group nor a distributed TCP port.
+packets to all ranks. Running requests live in a list, which keeps one order on
+every rank; a Python set's order can differ between processes. Only the last rank
+samples and broadcasts the tokens. Independent samplers on each rank would agree
+only while their random states stayed identical. GPU collectives are ordinary
+`torch.distributed` calls on NCCL. A single GPU needs neither a process group nor
+a distributed TCP port.
 
 An idle primary wakes once a second to broadcast an empty packet. Without that
 tick, other ranks wait in a Gloo receive that fails after its 60-second timeout.
@@ -283,9 +301,9 @@ shape exchange, and no rank coordinates another. Only sampled tokens have to tra
 back, because each scheduler must retire the same work. Unlike TP, PP changes no
 arithmetic, so its logits should match a single rank bit for bit.
 
-`distributed.send/recv/broadcast` use PyNCCL because it enqueues on the current CUDA
-stream, which lets graphs capture them. TP and PP are alternatives here; combining
-them needs two communicators and a rank grid.
+Decode graphs capture these NCCL calls along with the kernels, so TP all-reduces
+and PP sends and receives replay without Python. TP and PP are alternatives here;
+combining them needs two communicators and a rank grid.
 
 To try either on one GPU, pass `--tp 2` or `--pp 2`. NCCL normally rejects two ranks
 on one device ("Duplicate GPU detected"), so `Engine` gives each rank its own
@@ -293,8 +311,9 @@ on one device ("Duplicate GPU detected"), so `Engine` gives each rank its own
 
 For MoE, begin at `MoEFeedForward`: router logits select top-k experts, optional
 renormalization sets route weights, and expert projections shard the intermediate
-features across TP ranks. `moe.py` sorts/blocks token-expert assignments and
-launches two grouped matmuls. Read its tensor shapes before `moe_kernel.py`.
+features across TP ranks. `moe.py` sorts/blocks token-expert assignments,
+launches two grouped matmuls, and sums each token's weighted expert outputs. Read
+its tensor shapes before the Triton kernel at the end of the file.
 
 ## Bugs worth reproducing
 
@@ -313,6 +332,11 @@ and watch it fail.
 | Parity passes an off-by-one decode position | A limit set by prefill error dwarfed decode error | `test_decode_error_too_small_for_the_prefill_limit_still_fails` |
 | A stream loses its last word at the token limit | Text held for an incomplete character was never flushed | `test_final_token_flushes_text_held_for_an_incomplete_character` |
 | Generation runs past `<|endoftext|>` on Qwen3 | Stop tokens came from `config.json`; `generation_config.json` lists more | `test_stop_tokens_include_generation_config` |
+| Mistral with a window of 8 is 4.96 logprob off HF, yet short tests pass | `sliding_window` was dropped; the kernels attended to the whole prefix | `test_active_sliding_windows_are_rejected_rather_than_attending_too_far` |
+| KV sizing leaves too little activation memory at a short context | Warm-up ran one prompt of one context length, not a full batch of short ones | `test_warmup_covers_the_largest_batch_the_scheduler_can_form` |
+| A checkpoint missing `up_proj` loads, leaving that half uninitialized | A duplicate `gate_proj` file balanced the element count | `test_weight_loading_fills_every_parameter_or_fails` |
+| Batched `fi,trtllm` decode returns garbage or NaN after an unrelated allocation change | XQA keeps synchronization counters in a workspace that was allocated uninitialized | `test_trtllm_workspace_starts_with_zeroed_synchronization_counters` |
+| TP=2 of a 30B MoE on one GPU finds no memory for KV | Each rank subtracted the whole device's usage from its share of the budget | `test_automatic_kv_sizing_shares_device_memory_once` |
 
 ## Use commits as correctness exercises
 
@@ -402,13 +426,14 @@ fits in 96 GB), every engine exceeds the dense limits, references included:
 | Engine | median / max / decode max |
 |---|---|
 | This engine (PP=2 bitwise identical) | 0.042 / 1.94 / 0.234 |
-| This engine, TP=2 | 0.050 / 1.33 / 0.179 |
+| This engine, TP=2 | 0.049 / 1.33 / 0.179 |
 | SGLang 0.5.23 | 0.046 / 1.86 / 0.451 |
 | vLLM 0.24.0 (Triton MoE) | 0.043 / 2.79 / 0.546 |
 
 Top-k routing is discrete. A rounding difference that swaps the 8th and 9th expert
-moves one position by a whole logit, so the tail measures expert ties, not bugs:
-TP=2 differs from single-rank by up to 2.27 with the same code. The median stays
+can move one position by a whole logit, so a large tail is expected without any
+bug: TP=2 differs from single-rank by up to 2.27 with the same code. (Routing
+traces would be needed to attribute a particular outlier to a tie.) The median stays
 informative. Dropping top-k weight renormalization raises it to 0.67 (max 11.9),
 far beyond every engine. A decode-only RoPE shift is invisible here (decode max
 0.136): use the dense 0.6B models for that class. Compare MoE runs with
@@ -416,7 +441,8 @@ far beyond every engine. A decode-only RoPE shift is invisible here (decode max
 
 Tiny random-weight Qwen3-MoE (with and without `norm_topk_prob`), Mistral, and
 YaRN checkpoints also pass single-rank, TP=2, and PP=2 against Transformers.
-Reports and both negative controls are in [docs/parity](parity/README.md).
+[tests/make_tiny_checkpoints.py](../tests/make_tiny_checkpoints.py) writes such
+checkpoints. Reports and the negative controls are in [docs/parity](parity/README.md).
 
 With a 128-token prefill budget, graphs, and overlap, TP=2 scored the same
 Qwen3 targets with median/max error 0.030/0.533. PP=2 was bitwise identical to

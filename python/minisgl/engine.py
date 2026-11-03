@@ -10,24 +10,18 @@ from typing import NamedTuple
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.config import Config
-from minisgl.core import Batch, Request
-from minisgl.distributed import (
-    broadcast,
-    destroy_distributed,
-    enable_pynccl_distributed,
-    set_tp_info,
-)
+from minisgl.core import Batch, Request, SamplingParams
+from minisgl.distributed import broadcast, destroy_distributed, set_parallel_info
 from minisgl.graph import GraphRunner
 from minisgl.kvcache import MHAKVCache
-from minisgl.models import create_model, load_weight
+from minisgl.models import create_model, load_weights
 from minisgl.utils import (
     align_ceil,
+    compute_capability,
     div_ceil,
     div_even,
     format_memory,
-    get_free_memory,
     init_logger,
-    is_compute_capability_at_least,
     torch_dtype,
 )
 
@@ -71,7 +65,7 @@ def sample(logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
         import flashinfer.sampling as sampling
 
         probs = sampling.softmax(
-            logits.float(), args.temperatures, enable_pdl=is_compute_capability_at_least(9, 0)
+            logits.float(), args.temperatures, enable_pdl=compute_capability() >= (9, 0)
         )
         if args.top_k is None and args.top_p is None:
             tokens = sampling.sampling_from_probs(probs)
@@ -92,6 +86,19 @@ def sample(logits: torch.Tensor, args: BatchSamplingArgs) -> torch.Tensor:
 logger = init_logger(__name__)
 
 
+def largest_prefill(config: Config) -> list[int]:
+    """Prompt lengths of the largest prefill batch the scheduler can form.
+
+    Activations grow with tokens and logits with requests, so take both limits:
+    the whole prefill budget, spread over every request row, with each prompt
+    leaving room for one output token.
+    """
+    num_reqs = min(config.max_running_req, config.max_extend_tokens)
+    total = min(config.max_extend_tokens, num_reqs * max(config.max_seq_len - 1, 1))
+    base, extra = divmod(total, num_reqs)
+    return [base + (i < extra) for i in range(num_reqs)]
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -100,7 +107,7 @@ class ForwardOutput(NamedTuple):
 
 class Engine:
     def __init__(self, config: Config):
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        set_parallel_info(config.tp_info, config.world)
         self.config = config = resolve_engine_config(config)
 
         # One GPU per rank normally. With fewer GPUs than ranks, ranks share them.
@@ -113,51 +120,37 @@ class Engine:
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
 
-        self.tp_cpu_group = self._init_communication(config)
-        init_free_memory = self._sync_get_memory()[0]
+        self.cpu_group = self._init_communication(config)
+        init_free_memory = self._sync_get_memory()
         logger.info(f"Free memory before loading model: {format_memory(init_free_memory)}")
 
-        # Materialize checkpoint tensors without ever allocating random GPU weights.
-        with torch.device("meta"), torch_dtype(config.dtype):
-            self.model = create_model(
-                config.model_config, rope_device=self.device, pp_info=config.pp_info
-            )
-        weights = self._load_weight_state_dict(config)
-        if config.model_config.tie_word_embeddings:
-            # assign=True retains tensor storage: both parameters share one
-            # checkpoint allocation even when the Hub omits lm_head.weight.
-            # Under PP the head may live on a stage that has no embedding.
-            embedding = weights.get("model.embed_tokens.weight")
-            if self.model.lm_head is not None and embedding is not None:
-                weights["lm_head.weight"] = embedding
-            if self.model.model.embed_tokens is None:
-                weights.pop("model.embed_tokens.weight", None)
-        self.model.load_state_dict(weights, assign=True)
-        del weights
+        # Allocate parameters on the GPU, then copy each checkpoint shard into place.
+        with torch.device(self.device), torch_dtype(config.dtype):
+            self.model = create_model(config.model_config, pp_info=config.pp_info)
+        if config.use_dummy_weight:
+            for param in self.model.parameters():
+                param.data.normal_()
+        else:
+            load_weights(self.model, config.model_path, config.model_config, config.pp_info)
 
-        # Reserve physical KV storage after measuring the loaded model's footprint.
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
-        num_tokens = self.num_pages * config.page_size
+        # Page-table rows cover every position the model allows; KV capacity may
+        # turn out smaller. An int32 row is aligned to 128 bytes and holds physical
+        # token slots, not page numbers. The extra row feeds graph padding.
+        aligned_max_seq_len = align_ceil(config.max_seq_len, 32)
+        self.page_table = torch.zeros(
+            (config.max_running_req + 1, aligned_max_seq_len), dtype=torch.int32, device=self.device
+        )
+        # Size KV last: first run the largest prefill on a small pool and measure it.
+        warmup_lengths = largest_prefill(config)
         self.kv_cache = MHAKVCache(
             num_kv_heads=config.model_config.num_kv_heads,
             num_layers=len(self.model.model.layers),  # Only this pipeline stage's layers.
             head_dim=config.model_config.head_dim,
-            num_pages=self.num_pages + 1,  # +1 for dummy page
+            num_pages=div_ceil(max(warmup_lengths), config.page_size),
             page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
         )
-
-        # The extra row and page absorb graph padding. Each int32 row is aligned
-        # to 128 bytes and holds physical token offsets, rather than page numbers.
-        self.max_seq_len = min(config.max_seq_len, num_tokens)
-        aligned_max_seq_len = align_ceil(self.max_seq_len, 32)
-        self.page_table = torch.zeros(  # + 1 for dummy request
-            (config.max_running_req + 1, aligned_max_seq_len),
-            dtype=torch.int32,
-            device=self.device,
-        )
-
         self.attn_backend = create_attention_backend(
             config.attention_backend,
             config.model_config,
@@ -165,19 +158,18 @@ class Engine:
             self.page_table,
             config.page_size,
         )
+        activation_memory = self._measure_prefill_memory(warmup_lengths)
+        self.kv_cache.resize(0)  # Release the warm-up pool before measuring what is left.
+        self.num_pages = self._determine_num_pages(init_free_memory, activation_memory, config)
+        self.kv_cache.resize(self.num_pages + 1)  # +1 for the dummy page
+        num_tokens = self.num_pages * config.page_size
+        self.max_seq_len = min(config.max_seq_len, num_tokens)
 
-        post_free_memory = self._sync_get_memory()[0]
+        post_free_memory = self._sync_get_memory()
         logger.info(f"Free memory after initialization: {format_memory(post_free_memory)}")
 
-        self.dummy_req = Request(
-            input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
-            table_idx=config.max_running_req,
-            cached_len=0,
-            output_len=1,
-            uid=-1,
-            sampling_params=None,  # type: ignore
-            cache_handle=None,  # type: ignore
-        )
+        # Graph padding rows decode one token from a page no request owns.
+        self.dummy_req = Request(-1, [0], SamplingParams(max_tokens=1), config.max_running_req)
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         self.graph_runner = GraphRunner(
             stream=self.stream,
@@ -185,8 +177,6 @@ class Engine:
             model=self.model,
             attn_backend=self.attn_backend,
             cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
-            free_memory=init_free_memory,
             max_running_req=config.max_running_req,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -194,6 +184,7 @@ class Engine:
         )
 
     def _init_communication(self, config: Config) -> torch.distributed.ProcessGroup | None:
+        """NCCL moves GPU tensors; a Gloo group moves CPU requests and memory totals."""
         # A single GPU needs no process group, local TCP port, or CPU collective.
         world = config.world
         if world.size == 1:
@@ -201,46 +192,53 @@ class Engine:
         if self.ranks_per_gpu > 1:
             # NCCL rejects two ranks on one GPU ("Duplicate GPU detected") unless
             # they claim to be different hosts. They then talk over loopback TCP:
-            # slow, but the same collectives and code path as real multi-GPU TP.
+            # slow, but the same collectives and code path as real multi-GPU runs.
             os.environ["NCCL_HOSTID"] = f"minisgl-rank-{world.rank}"
             os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
-        if config.use_pynccl:
-            torch.distributed.init_process_group(
-                backend="gloo",
-                rank=world.rank,
-                world_size=world.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.group.WORLD
-            assert tp_cpu_group is not None
-            max_bytes = (
-                config.max_extend_tokens * config.model_config.hidden_size * self.dtype.itemsize
-            )
-            enable_pynccl_distributed(world, tp_cpu_group, max_bytes)
-        else:
-            torch.distributed.init_process_group(
-                backend="nccl",
-                rank=world.rank,
-                world_size=world.size,
-                timeout=timedelta(seconds=config.distributed_timeout),
-                init_method=config.distributed_addr,
-            )
-            tp_cpu_group = torch.distributed.new_group(backend="gloo")
-            assert tp_cpu_group is not None
-        return tp_cpu_group
+        torch.distributed.init_process_group(
+            backend="nccl",
+            rank=world.rank,
+            world_size=world.size,
+            timeout=timedelta(seconds=config.distributed_timeout),
+            init_method=config.distributed_addr,
+        )
+        return torch.distributed.new_group(backend="gloo")
 
-    def _load_weight_state_dict(self, config: Config) -> dict[str, torch.Tensor]:
-        if config.use_dummy_weight:
-            return {
-                k: torch.randn_like(v, device=self.device)
-                for k, v in self.model.state_dict().items()
-            }
-        weights = load_weight(config.model_path, self.device, config.pp_info)
-        return {k: v.to(self.dtype) for k, v in weights}
+    @torch.inference_mode()
+    def _measure_prefill_memory(self, lengths: list[int]) -> int:
+        """Run the largest prefill and its sampling once; return the memory they needed."""
+        # Stochastic settings with top-k and top-p take the sampler's largest path.
+        params = SamplingParams(temperature=1.0, top_k=2, top_p=0.5, max_tokens=1)
+        batch = Batch(
+            [Request(-1, [0] * n, params, row) for row, n in enumerate(lengths)], "prefill"
+        )
+        batch.padded_reqs = batch.reqs
+        # Every row maps position p to slot p, sharing the small warm-up pool.
+        # Requests overwrite each other's KV, but only memory is measured here.
+        self.page_table[: len(lengths), : max(lengths)] = torch.arange(max(lengths))
+        positions = torch.cat([torch.arange(n, dtype=torch.int32) for n in lengths])
+        batch.positions = batch.out_loc = positions.to(self.device)
+        batch.input_ids = torch.zeros_like(batch.positions)
+        batch.last_token_indices = torch.tensor(lengths).cumsum(0).sub(1).to(self.device)
+        self.attn_backend.prepare_metadata(batch)
+        args = prepare_sampling_args(batch, self.device, self.config.model_config.vocab_size)
+        torch.cuda.synchronize(self.device)
+        before = torch.cuda.memory_allocated(self.device)
+        torch.cuda.reset_peak_memory_stats(self.device)
+        logits = self.model(batch, self.attn_backend)
+        if logits is not None:  # Only the last pipeline stage samples.
+            sample(logits, args)
+        torch.cuda.synchronize(self.device)
+        peak = torch.tensor(torch.cuda.max_memory_allocated(self.device) - before)
+        if self.cpu_group is not None:  # Ranks must agree on one page count.
+            torch.distributed.all_reduce(peak, torch.distributed.ReduceOp.MAX, self.cpu_group)
+        logger.info(
+            f"A {sum(lengths)}-token prefill of {len(lengths)} requests needs "
+            f"{format_memory(int(peak))} of activations"
+        )
+        return int(peak)
 
-    def _determine_num_pages(self, old_free_memory: int, config: Config) -> int:
-        new_free_memory = self._sync_get_memory()[0]
+    def _determine_num_pages(self, init_free: int, activation_memory: int, config: Config) -> int:
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
@@ -252,10 +250,11 @@ class Engine:
         )
         num_pages = config.num_page_override
         if num_pages is None:
-            model_memory = old_free_memory - new_free_memory
-            budget = config.memory_ratio * old_free_memory / self.ranks_per_gpu
-            available_memory = int(budget) - model_memory
-            num_pages = available_memory // cache_per_page
+            # Weights, page tables, and workspaces are allocated; activations are not.
+            # Both measurements are device-wide: share usage as well as budget.
+            used_per_rank = (init_free - self._sync_get_memory()) / self.ranks_per_gpu
+            budget_per_rank = config.memory_ratio * init_free / self.ranks_per_gpu
+            num_pages = int(budget_per_rank - used_per_rank - activation_memory) // cache_per_page
 
         if num_pages < 1:
             raise ValueError(
@@ -268,28 +267,16 @@ class Engine:
         )
         return num_pages
 
-    def _sync_get_memory(self) -> tuple[int, int]:
-        """Use the minimum free memory: all TP ranks must fit the same page count."""
+    def _sync_get_memory(self) -> int:
+        """The minimum free memory over ranks: all must fit the same page count."""
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
-        free_memory = get_free_memory(self.device)
-        if self.tp_cpu_group is None:
-            return free_memory, free_memory
-        free_mem_tensor = torch.tensor([free_memory, -free_memory], device="cpu", dtype=torch.int64)
-        torch.distributed.all_reduce(
-            free_mem_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_cpu_group
-        )
-        min_free_memory = int(free_mem_tensor[0].item())
-        max_free_memory = -int(free_mem_tensor[1].item())
-        if max_free_memory - min_free_memory > 2 * 1024 * 1024 * 1024:
-            logger.error(
-                f"Memory across TP ranks are imbalanced:"
-                f" min {format_memory(min_free_memory)}, max {format_memory(max_free_memory)}"
+        free_memory = torch.tensor(torch.cuda.mem_get_info(self.device)[0])
+        if self.cpu_group is not None:
+            torch.distributed.all_reduce(
+                free_memory, torch.distributed.ReduceOp.MIN, self.cpu_group
             )
-            raise RuntimeError("Memory across TP ranks are imbalanced")
-
-        return min_free_memory, max_free_memory
+        return int(free_memory)
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
@@ -302,15 +289,17 @@ class Engine:
         for req in batch.reqs:
             req.advance_after_forward()
 
-        # Only the last pipeline stage has logits. Every rank needs the tokens: they
-        # feed the next decode, and each rank's scheduler must retire the same work.
-        pp = self.config.pp_info
-        if pp.rank == pp.size - 1:
+        # One rank samples: the last, the only pipeline stage with logits. Under TP
+        # every rank has them, but independent samplers would agree only while their
+        # random states stayed identical. Every rank needs the tokens: they feed the
+        # next decode, and each rank's scheduler must retire the same work.
+        world = self.config.world
+        if world.rank == world.size - 1:
             next_tokens_gpu = sample(logits[: batch.size], args).to(torch.int32)
         else:
             next_tokens_gpu = torch.empty(batch.size, dtype=torch.int32, device=self.device)
-        if pp.size > 1:
-            broadcast(next_tokens_gpu, src=pp.size - 1)
+        if world.size > 1:
+            broadcast(next_tokens_gpu, src=world.size - 1)
         next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
@@ -318,7 +307,7 @@ class Engine:
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
-        if self.tp_cpu_group is not None:
+        if self.cpu_group is not None:
             torch.distributed.destroy_process_group()
         destroy_distributed()
 
@@ -328,9 +317,7 @@ def resolve_engine_config(config: Config) -> Config:
     backend, page_size = config.attention_backend, config.page_size
     if backend == "auto":
         # TRT-LLM's prefill kernels target SM10x; SM12x (e.g. RTX PRO 6000) has none.
-        is_sm10x = is_compute_capability_at_least(10, 0) and not (
-            is_compute_capability_at_least(12, 0)
-        )
+        is_sm10x = (10, 0) <= compute_capability() < (12, 0)
         backend = "trtllm" if is_sm10x else "fi"
         logger.info(f"Auto-selected attention backend: {backend}")
 

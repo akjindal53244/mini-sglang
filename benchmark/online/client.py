@@ -1,4 +1,4 @@
-"""Optional timing helpers. Inference does not import this module.
+"""HTTP client helpers shared by the online benchmark scripts in this folder.
 
 HTTP streams contain text chunks, not necessarily one token per event. Report
 time to first text and request latency; do not count role/finish events as tokens.
@@ -17,47 +17,6 @@ from minisgl.utils import init_logger
 from tqdm import tqdm
 
 logger = init_logger(__name__)
-
-
-def perf_cuda(function, *, repetitions=10, cuda_graph_repetitions=10, init_stream=True):
-    import torch
-
-    stream = torch.cuda.Stream() if init_stream else torch.cuda.current_stream()
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    with torch.cuda.stream(stream):
-        function()
-        count = cuda_graph_repetitions or 1
-        if cuda_graph_repetitions:
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                for _ in range(count):
-                    function()
-            run = graph.replay
-        else:
-            run = function
-        run()
-        start.record()
-        for _ in range(repetitions):
-            run()
-        end.record()
-        end.synchronize()
-    return start.elapsed_time(end) / (count * repetitions)
-
-
-def compare_memory_kernel_perf(
-    *, baseline, our_impl, memory_footprint, description="", extra_kwargs=None
-):
-    durations = [perf_cuda(function, **(extra_kwargs or {})) for function in (baseline, our_impl)]
-    bandwidths = [memory_footprint / (milliseconds * 1e6) for milliseconds in durations]
-    logger.info(
-        "%s baseline %.3f ms / %.1f GB/s; kernel %.3f ms / %.1f GB/s",
-        description,
-        durations[0],
-        bandwidths[0],
-        durations[1],
-        bandwidths[1],
-    )
-    return tuple(bandwidths)
 
 
 @dataclass(frozen=True)

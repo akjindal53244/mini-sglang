@@ -1,7 +1,7 @@
 """Typed CPU messages and MessagePack transport between local processes.
 
-Only token IDs and request settings cross these sockets. KV tensors and model
-activations remain on GPU; tensor-parallel collectives use NCCL instead.
+Only token IDs and request settings cross these sockets, as plain lists and
+numbers. KV tensors and activations stay on GPU; collectives use NCCL instead.
 """
 
 from __future__ import annotations
@@ -9,18 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 
 import msgpack
-import numpy as np
-import torch
 import zmq
 import zmq.asyncio
 from minisgl.core import SamplingParams
 
 
 def serialize_type(value):
-    if isinstance(value, torch.Tensor):
-        if not value.is_cpu or value.ndim != 1:
-            raise ValueError("IPC tensors must be one-dimensional and on CPU")
-        return {"__type__": "Tensor", "buffer": value.numpy().tobytes(), "dtype": str(value.dtype)}
     if is_dataclass(value):
         return {
             "__type__": type(value).__name__,
@@ -41,10 +35,6 @@ def deserialize_type(classes, value):
     if not isinstance(value, dict):
         return value
     name = value.get("__type__")
-    if name == "Tensor":
-        dtype = getattr(np, value["dtype"].removeprefix("torch."))
-        # MessagePack owns these bytes. Copy before making a writable tensor.
-        return torch.from_numpy(np.frombuffer(value["buffer"], dtype=dtype).copy())
     data = {
         key: deserialize_type(classes, item) for key, item in value.items() if key != "__type__"
     }
@@ -68,7 +58,7 @@ class BatchMsg(Message):
 @dataclass
 class UserMsg(Message):
     uid: int
-    input_ids: torch.Tensor  # CPU 1D int32 tensor
+    input_ids: list[int]
     sampling_params: SamplingParams
 
 

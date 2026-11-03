@@ -1,55 +1,36 @@
+"""Check the Triton KV store against PyTorch indexing, then time both in CUDA graphs."""
+
 from __future__ import annotations
 
 import torch
-from minisgl.benchmark import compare_memory_kernel_perf
-from minisgl.kernel import store_cache
+from minisgl.kvcache import store_kv
+from triton.testing import do_bench_cudagraph
 
 
-def test_store_cache():
-    HEAD_SIZE = 128
-    NUM_TOKENS = 1048576  # 1M
-    stream = torch.cuda.Stream()
-    torch.cuda.set_stream(stream)
-    kv_cache = torch.randn((NUM_TOKENS, 2, HEAD_SIZE), device="cuda", dtype=torch.float16)
-    k_cache = kv_cache[:, 0, :]
-    v_cache = kv_cache[:, 1, :]
+def main():
+    head_size, num_slots = 128, 1 << 20
+    k_cache = torch.randn((num_slots, head_size), device="cuda", dtype=torch.float16)
+    v_cache = torch.randn_like(k_cache)
+    for num_tokens in [2**n for n in range(16)]:
+        # Slots must be unique: duplicates make the expected result ambiguous.
+        slots = torch.randperm(num_slots, device="cuda")[:num_tokens].to(torch.int32)
+        qkv = torch.randn((num_tokens, head_size * 4), device="cuda", dtype=torch.float16)
+        k, v = qkv[:, :head_size], qkv[:, head_size : 2 * head_size]  # Strided, as in the model.
+        store_kv(k_cache, v_cache, slots, k, v)
+        assert torch.equal(k_cache[slots], k) and torch.equal(v_cache[slots], v), num_tokens
 
-    for bs in [2**n for n in range(0, 16)]:
-        # NOTE: we cannot tolerate duplicate indices in this test
-        indices = torch.randperm(NUM_TOKENS, device="cuda")[:bs].to(torch.int32)
-        qkv = torch.randn((bs, HEAD_SIZE * 4), device="cuda", dtype=torch.float16)
-        k = qkv[:, :HEAD_SIZE]
-        v = qkv[:, HEAD_SIZE : HEAD_SIZE * 2]
-        store_cache(
-            k_cache,
-            v_cache,
-            indices,
-            k,
-            v,
-        )
+        def indexing(index=slots.long()):
+            k_cache[index] = k
+            v_cache[index] = v
 
-        assert torch.all(k_cache[indices] == k), bs
-        assert torch.all(v_cache[indices] == v), bs
-
-        # 2 = k + v
-        MEM = bs * HEAD_SIZE * 2 * kv_cache.element_size()
-
-        k = k.contiguous()
-        v = v.contiguous()
-
-        @torch.compile()
-        def baseline():
-            k_cache[indices] = k
-            v_cache[indices] = v
-
-        compare_memory_kernel_perf(
-            our_impl=lambda: store_cache(k_cache, v_cache, indices, k, v),
-            baseline=baseline,
-            memory_footprint=MEM,
-            description=f"BS={bs:6d} | ",
-            extra_kwargs={"init_stream": False},
+        triton_ms = do_bench_cudagraph(lambda: store_kv(k_cache, v_cache, slots, k, v))
+        torch_ms = do_bench_cudagraph(indexing)
+        written = 2 * num_tokens * head_size * k_cache.element_size()  # K and V bytes
+        print(
+            f"T={num_tokens:6d}: Triton {triton_ms * 1e3:7.2f} us "
+            f"({written / triton_ms / 1e6:6.1f} GB/s), indexing {torch_ms * 1e3:7.2f} us"
         )
 
 
 if __name__ == "__main__":
-    test_store_cache()
+    main()

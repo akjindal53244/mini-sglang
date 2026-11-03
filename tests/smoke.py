@@ -145,9 +145,9 @@ def main():
         }
         if args.compare:
             reference = json.loads(args.compare.read_text())
-            assert (
-                report["model_commit"] == reference["model_commit"]
-            ), "Checkpoint revisions differ"
+            assert report["model_commit"] == reference["model_commit"], (
+                "Checkpoint revisions differ"
+            )
             assert prompts == reference["input_token_ids"], "Input token IDs differ"
             assert outputs[0] == reference["outputs"], "Generated token IDs/text differ"
         if args.report:

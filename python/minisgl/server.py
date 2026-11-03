@@ -49,12 +49,6 @@ class WorkerUnavailable(RuntimeError):
     """The serving workers cannot complete this request."""
 
 
-class GenerateRequest(BaseModel):
-    prompt: str = Field(min_length=1)
-    max_tokens: int = Field(gt=0)
-    ignore_eos: bool = False
-
-
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
@@ -65,7 +59,8 @@ class OpenAICompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage] | None = None
     prompt: str | None = Field(default=None, min_length=1)  # Raw-prompt extension.
-    max_tokens: int = Field(default=16, gt=0)
+    # KV for the whole budget is reserved at admission, so keep the default finite.
+    max_tokens: int = Field(default=SamplingParams.max_tokens, gt=0)
     temperature: float = Field(default=1.0, ge=0)
     top_k: int = Field(default=-1, ge=-1)
     top_p: float = Field(default=1.0, gt=0, le=1)
@@ -297,23 +292,6 @@ def create_app(frontend: FrontendManager) -> FastAPI:
             ],
         }
 
-    @app.post("/generate")
-    async def generate(request: GenerateRequest):
-        uid = await frontend.submit(
-            request.prompt,
-            SamplingParams(max_tokens=request.max_tokens, ignore_eos=request.ignore_eos),
-        )
-
-        async def raw_stream():
-            try:
-                async for reply in frontend.responses(uid):
-                    yield f"data: {reply.incremental_output}\n".encode()
-            except (ValueError, WorkerUnavailable) as error:
-                yield _sse({"error": {"message": str(error)}})
-            yield b"data: [DONE]\n"
-
-        return StreamingResponse(raw_stream(), media_type="text/event-stream")
-
     return app
 
 
@@ -361,13 +339,13 @@ def _receive_requests(receiver, group, primary: bool, idle: bool) -> list[Messag
     raw = []
     if primary:
         if idle:
-            # Sleep until work arrives. With TP, wake every second anyway: the other
-            # ranks wait in the Gloo broadcast below, which fails after its timeout.
+            # Sleep until work arrives. With several ranks, wake every second anyway:
+            # the others wait in the Gloo broadcast below, which fails after a timeout.
             receiver.socket.poll(timeout=None if group is None else 1000)
         while not receiver.empty():
             raw.append(receiver.get_raw())
     if group is not None:
-        # Keep all TP ranks in lockstep. Empty decode steps broadcast only a
+        # Keep all TP or PP ranks in lockstep. Empty decode steps broadcast only a
         # count; variable-size request packets use Gloo's object broadcast.
         count = torch.tensor(len(raw))
         torch.distributed.broadcast(count, src=0, group=group)
@@ -387,7 +365,7 @@ def _run_scheduler(config: Config, ready):
     primary = config.world.is_primary()
     receiver = ZmqQueue(config.ipc("requests"), zmq.PULL, bind=True) if primary else None
     sender = ZmqQueue(config.ipc("tokenizer"), zmq.PUSH) if primary else None
-    group = scheduler.engine.tp_cpu_group
+    group = scheduler.engine.cpu_group
     if group is not None:
         group.barrier().wait()
     if primary:
