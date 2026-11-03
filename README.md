@@ -1,186 +1,155 @@
-<p align="center">
-<img width="400" src="/assets/logo.png">
-</p>
-
 # Mini-SGLang
 
-A **lightweight yet high-performance** inference framework for Large Language Models.
+A small LLM inference engine for learning how serving works, from a chat message
+to GPU execution and back. This educational revamp builds on
+[sgl-project/mini-sglang](https://github.com/sgl-project/mini-sglang), with the
+readability goals of [nanoGPT](https://github.com/karpathy/nanoGPT) and
+[nanochat](https://github.com/karpathy/nanochat).
 
----
+The package has **20 Python files: 19 for inference and serving, one for optional
+benchmark helpers**. The transformer is an ordinary PyTorch `nn.Module`. One
+scheduler handles both offline and online inference. The optimizations remain
+visible: continuous batching, chunked prefill, paged KV storage, radix prefix
+reuse, CUDA graphs, CPU/GPU overlap, tensor and pipeline parallelism, and routed
+experts.
 
-Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-project/sglang), designed to demystify the complexities of modern LLM serving systems. With a compact codebase of **~5,000 lines of Python**, it serves as both a capable inference engine and a transparent reference for researchers and developers.
+## Run it
 
-## ✨ Key Features
-
-- **High Performance**: Achieves state-of-the-art throughput and latency with advanced optimizations.
-- **Lightweight & Readable**: A clean, modular, and fully type-annotated codebase that is easy to understand and modify.
-- **Advanced Optimizations**:
-  - **Radix Cache**: Reuses KV cache for shared prefixes across requests.
-  - **Chunked Prefill**: Reduces peak memory usage for long-context serving.
-  - **Overlap Scheduling**: Hides CPU scheduling overhead with GPU computation.
-  - **Tensor Parallelism**: Scales inference across multiple GPUs.
-  - **Optimized Kernels**: Integrates **FlashAttention** and **FlashInfer** for maximum efficiency.
-  - ...
-
-## 🚀 Quick Start
-
-> **⚠️ Platform Support**: Mini-SGLang currently supports **Linux only** (x86_64 and aarch64). Windows and macOS are not supported due to dependencies on Linux-specific CUDA kernels (`sgl-kernel`, `flashinfer`). We recommend using [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) on Windows or Docker for cross-platform compatibility.
-
-### 1. Environment Setup
-
-We recommend using `uv` for a fast and reliable installation (note that `uv` does not conflict with `conda`).
+The reference environment is **Linux, Python 3.12, PyTorch 2.9.1 with CUDA 12.8**.
+You need an NVIDIA GPU, a compatible driver, the CUDA toolkit (`nvcc`), and a C++
+compiler. The small native kernels compile on first use. The commands below run
+from this checkout; use your own fork when sharing the revamped version.
 
 ```bash
-# Create a virtual environment (Python 3.10+ recommended)
-uv venv --python=3.12
+uv venv --python 3.12
 source .venv/bin/activate
+uv pip install -e '.[dev]' -c constraints.txt --torch-backend cu128
+python -m minisgl --model Qwen/Qwen3-0.6B --shell
 ```
 
-**Prerequisites**: Mini-SGLang relies on CUDA kernels that are JIT-compiled. Ensure you have the **NVIDIA CUDA Toolkit** installed and that its version matches your driver's version. You can check your driver's CUDA capability with `nvidia-smi`.
+Try `What is 2+2? /no_think`. Qwen3 otherwise may produce a long thinking trace.
+`/reset` clears the conversation; `/exit` closes the workers.
 
-### 2. Installation
+This checkout is tested on **RTX PRO 6000 Blackwell (SM120)**. `--attn auto` selects
+FlashInfer for both phases there. Backend performance tuning remains in
+[TODO.md](TODO.md). [constraints.txt](constraints.txt) records the tested direct
+dependency versions; it is a reference environment, not a complete platform lock.
 
-Install Mini-SGLang directly from the source:
+## Follow a single request
+
+Start without graphs, overlap, or prefix reuse. Then enable each optimization
+and compare the output IDs. The same scheduler executes both versions.
+
+```python
+from minisgl.core import SamplingParams
+from minisgl.llm import LLM
+
+with LLM(
+    "Qwen/Qwen3-0.6B",
+    num_page_override=16384,       # A small, fixed KV pool for this example.
+    max_seq_len_override=2048,
+    max_running_req=4,
+    cuda_graph_max_bs=0,
+    overlap=False,
+    cache_type="naive",
+) as llm:
+    ids = llm.tokenizer.apply_chat_template(
+        [{"role": "user", "content": "What is 2+2?"}],
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    result = llm.generate([ids], SamplingParams(temperature=0, max_tokens=32))
+    print(result[0]["text"])
+```
+
+String inputs to `LLM.generate` are raw prompts. Supply chat-template IDs, as
+above, when matching the shell or HTTP behavior.
+
+Read [models.py](python/minisgl/models.py) first if you want to begin with the
+familiar transformer. To trace execution, follow
+[llm.py](python/minisgl/llm.py) → [scheduler.py](python/minisgl/scheduler.py) →
+[engine.py](python/minisgl/engine.py) → the model. The
+[walkthrough guide](docs/learning-guide.md) maps all files, explains the state and
+memory invariants, and suggests exercises from the original commit history.
+
+## Serve chat over HTTP
 
 ```bash
-git clone https://github.com/sgl-project/mini-sglang.git
-cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-uv pip install -e .
+python -m minisgl --model Qwen/Qwen3-0.6B \
+    --max-running-requests 8 --cuda-graph-max-bs 8
 ```
-
-<details>
-<summary><b>💡 Installing on Windows (WSL2)</b></summary>
-
-Since Mini-SGLang requires Linux-specific dependencies, Windows users should use WSL2:
-
-1. **Install WSL2** (if not already installed):
-   ```powershell
-   # In PowerShell (as Administrator)
-   wsl --install
-   ```
-
-2. **Install CUDA on WSL2**:
-   - Follow [NVIDIA's WSL2 CUDA guide](https://docs.nvidia.com/cuda/wsl-user-guide/index.html)
-   - Ensure your Windows GPU drivers support WSL2
-
-3. **Install Mini-SGLang in WSL2**:
-   ```bash
-   # Inside WSL2 terminal
-   git clone https://github.com/sgl-project/mini-sglang.git
-   cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-   uv pip install -e .
-   ```
-
-4. **Access from Windows**: The server will be accessible at `http://localhost:8000` from Windows browsers and applications.
-
-</details>
-
-<details>
-<summary><b>🐳 Running with Docker</b></summary>
-
-**Prerequisites**:
-- [Docker](https://docs.docker.com/get-docker/)
-- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-
-1. **Build the Docker image**:
-   ```bash
-   docker build -t minisgl .
-   ```
-
-2. **Run the server**:
-   ```bash
-   docker run --gpus all -p 1919:1919 \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
-   ```
-
-3. **Run in interactive shell mode**:
-   ```bash
-   docker run -it --gpus all \
-       minisgl --model Qwen/Qwen3-0.6B --shell
-   ```
-
-4. **Using Docker Volumes for persistent caches** (recommended for faster subsequent startups):
-   ```bash
-   docker run --gpus all -p 1919:1919 \
-       -v huggingface_cache:/app/.cache/huggingface \
-       -v tvm_cache:/app/.cache/tvm-ffi \
-       -v flashinfer_cache:/app/.cache/flashinfer \
-       minisgl --model Qwen/Qwen3-0.6B --host 0.0.0.0
-   ```
-
-</details>
-
-### 3. Online Serving
-
-Launch an OpenAI-compatible API server with a single command.
 
 ```bash
-# Deploy Qwen/Qwen3-0.6B on a single GPU
-python -m minisgl --model "Qwen/Qwen3-0.6B"
-
-# Deploy meta-llama/Llama-3.1-70B-Instruct on 4 GPUs with Tensor Parallelism, on port 30000
-python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
+curl http://127.0.0.1:1919/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"Qwen/Qwen3-0.6B", "messages":[{"role":"user","content":"What is 2+2? /no_think"}], "temperature":0, "max_tokens":64}'
 ```
 
-Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
+Add `"stream":true` for SSE output. `/v1/models` lists the loaded model. This is a
+small chat-completions API: it supports text messages, temperature, top-k, top-p,
+output budgets, and cancellation. A worker failure rejects new requests with
+HTTP 503, fails waiting requests, and shuts the server down with a nonzero exit
+code. Unsupported settings such as tools, stop strings, multiple completions,
+and nonzero penalties are rejected. Usage token counts are currently omitted.
+`/generate` retains the original raw-text stream.
 
-### 4. Interactive Shell
-
-Chat with your model directly in the terminal by adding the `--shell` flag.
+## Check correctness
 
 ```bash
-python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
+python -m pytest -q
+python tests/smoke.py --report /tmp/minisgl-reference.json
+python tests/smoke.py --serial --no-graph --page-size 16 \
+    --compare /tmp/minisgl-reference.json
 ```
 
-![shell-example](https://lmsys.org/images/blog/minisgl/shell.png)
+The GPU smoke workload repeats prompts, forces chunked prefill, pads decode batches,
+checks that a cache hit preserves the logit distribution, and checks KV accounting.
+Reports include checkpoint and software revisions, source hashes, input IDs, and
+output IDs. Use a local Hub snapshot path with `--model` to freeze the checkpoint.
+CPU tests need no model download; radix tests compile a small C++ binding.
 
-You can also use `/reset` to clear the chat history.
-
-## Benchmark
-
-### Offline inference
-
-See [bench.py](./benchmark/offline/bench.py) for more details. Set `MINISGL_DISABLE_OVERLAP_SCHEDULING=1` for ablation study on overlap scheduling.
-
-Test Configuration:
-
-- Hardware: 1xH200 GPU.
-- Model: Qwen3-0.6B, Qwen3-14B
-- Total Requests: 256 sequences
-- Input Length: Randomly sampled between 100-1024 tokens
-- Output Length: Randomly sampled between 100-1024 tokens
-
-![offline](https://lmsys.org/images/blog/minisgl/offline.png)
-
-### Online inference
-
-See [benchmark_qwen.py](./benchmark/online/bench_qwen.py) for more details.
-
-Test Configuration:
-
-- Hardware: 4xH200 GPU, connected by NVLink.
-- Model: Qwen3-32B
-- Dataset: [Qwen trace](https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon/blob/main/qwen_traceA_blksz_16.jsonl), replaying first 1000 requests.
-
-Launch command:
+On this SM120 setup, the hybrid backend can also be checked with:
 
 ```bash
-# Mini-SGLang
-python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --cache naive
-
-# SGLang
-python3 -m sglang.launch_server --model "Qwen/Qwen3-32B" --tp 4 \
-    --disable-radix --port 1919 --decode-attention flashinfer
+python tests/smoke.py --attn fi,trtllm --page-size 64 \
+    --compare /tmp/minisgl-reference.json
 ```
 
-> **Note**: If you encounter network issues when downloading models from HuggingFace, try using `--model-source modelscope` to download from ModelScope instead:
-> ```bash
-> python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --model-source modelscope
-> ```
+[tests/parity.py](tests/parity.py) compares this engine with Transformers, SGLang,
+and vLLM on identical prompt **and continuation** IDs. Mini-SGLang forces the
+reference continuation through prefill/decode; greedy text is a separate diagnostic.
+The checker rejects nonfinite or incomplete scores, compares every position, and
+applies a separate, tighter limit to decode.
+Create an HF report, then pass it to each engine with `--reference hf.json`. Older
+parity reports must be regenerated. Its docstring has the setup commands, and the
+[validation workflow](docs/learning-guide.md#validation-workflow) has the results.
 
-![online](https://lmsys.org/images/blog/minisgl/online.png)
+## Scope and switches
 
-## 📚 Learn More
+Run `python -m minisgl --help` for the CLI. Useful switches are `--attn`,
+`--page-size`, `--cache naive`, `--disable-overlap`, `--cuda-graph-max-bs 0`,
+`--max-prefill-length`, `--tp`, and `--pp`.
 
-- **[Detailed Features](./docs/features.md)**: Explore all available features and command-line arguments.
-- **[System Architecture](./docs/structures.md)**: Dive deep into the design and data flow of Mini-SGLang.
+The implemented decoder families are Llama, Qwen2/2.5, Qwen3, Qwen3-MoE, and the
+Mistral text decoder. The exact architecture table lives in `models.py`.
+Hybrid/recurrent attention, sliding-window attention, vision input, quantization,
+and speculative decoding are outside this implementation. Qwen3.8-27B support is
+follow-up work.
+
+`--tp N` splits each layer across N ranks; `--pp N` splits the decoder into N stages
+of layers. They are alternatives, not a grid. With fewer GPUs than ranks, ranks
+share a GPU and NCCL runs over loopback TCP: slow, but the real code path, so both
+can be studied on one GPU. Only that single-GPU mode has been tested so far.
+
+Optional tools have separate dependencies:
+
+```bash
+uv pip install -e '.[benchmark]' -c constraints.txt  # OpenAI client + Parquet reader
+uv pip install -e '.[modelscope]'                  # --model-source modelscope
+```
+
+See [benchmark/README.md](benchmark/README.md) for workloads and timing definitions,
+and [TODO.md](TODO.md) for backend tuning and reference-engine validation.
+
+Mini-SGLang retains its upstream [MIT license](LICENSE).

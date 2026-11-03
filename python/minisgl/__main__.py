@@ -1,5 +1,4 @@
-from .server import launch_server
+from minisgl.server import launch_server
 
-assert __name__ == "__main__"
-
-launch_server()
+if __name__ == "__main__":
+    launch_server()

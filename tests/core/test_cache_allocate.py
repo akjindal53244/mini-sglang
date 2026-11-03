@@ -1,34 +1,23 @@
 """
-Test that CacheManager._allocate correctly handles eviction with page_size > 1.
+Test that KVCacheManager._allocate correctly handles eviction with page_size > 1.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
-
-import minisgl.core as core
-from minisgl.scheduler.cache import CacheManager
+from minisgl.kvcache import KVCacheManager
 
 
-@pytest.fixture(autouse=True)
-def reset_global_ctx():
-    """Reset global context before and after each test."""
-    old_ctx = core._GLOBAL_CTX
-    core._GLOBAL_CTX = None
-    yield
-    core._GLOBAL_CTX = old_ctx
-
-
-def _make_cache_manager(num_pages: int, page_size: int) -> CacheManager:
-    """Helper to create a CacheManager with radix cache on CPU."""
+def _make_cache_manager(num_pages: int, page_size: int) -> KVCacheManager:
+    """Helper to create a KVCacheManager with radix cache on CPU."""
     page_table = torch.empty((1,))
-    ctx = core.Context(page_size=page_size)
-    core.set_global_ctx(ctx)
-    return CacheManager(num_pages, page_size, page_table, type="radix")
+    return KVCacheManager(num_pages, page_size, page_table, cache_type="radix")
 
 
-def _insert_evictable(cm: CacheManager, input_ids: torch.Tensor, indices: torch.Tensor):
+def _insert_evictable(cm: KVCacheManager, input_ids: torch.Tensor, indices: torch.Tensor):
     """Insert a prefix into the radix cache so it becomes evictable."""
     cm.prefix_cache.insert_prefix(input_ids, indices)
 
@@ -66,7 +55,7 @@ class TestAllocateEvictPageAlignment:
 
         # Exhaust all free pages
         cm._allocate(num_pages)
-        assert len(cm.free_slots) == 0
+        assert len(cm.free_pages) == 0
 
         # Insert 2 pages worth of data into the cache (evictable)
         input_ids = torch.arange(page_size * 2, dtype=torch.int32)
@@ -77,7 +66,7 @@ class TestAllocateEvictPageAlignment:
         # Allocate 1 page — triggers eviction
         allocated = cm._allocate(1)
         _assert_all_page_aligned(allocated, page_size, "allocated")
-        _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots after evict")
+        _assert_all_page_aligned(cm.free_pages, page_size, "_free_slots after evict")
 
     def test_consecutive_allocations_after_evict_no_overlap(self):
         """Multiple allocations after eviction must not produce overlapping pages."""
@@ -121,7 +110,7 @@ class TestAllocateEvictPageAlignment:
         cm._allocate(1)
 
         # All remaining free slots must be page-aligned
-        _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots")
+        _assert_all_page_aligned(cm.free_pages, page_size, "_free_slots")
 
     def test_allocate_exact_pages_needed_from_evict(self):
         """When exactly N pages are needed, eviction must provide at least N pages."""
@@ -169,14 +158,14 @@ class TestAllocateEvictPageAlignment:
             assert chunk == expected, f"Page {page_start}: got {chunk}, expected {expected}"
 
     def test_check_integrity_passes_after_evict_cycle(self):
-        """CacheManager integrity check should pass after allocate-free-evict cycles."""
+        """KVCacheManager integrity check should pass after allocate-free-evict cycles."""
         page_size = 4
         num_pages = 8
         cm = _make_cache_manager(num_pages, page_size)
 
         # Allocate 2 pages (simulating a request using them)
         pages_for_cache = cm._allocate(2)
-        # free_slots: 6 pages remaining
+        # free_pages: 6 pages remaining
 
         # Insert those 2 pages into radix cache (simulating a finished request)
         # The token indices come from _page_to_token expansion of the allocated pages
@@ -191,12 +180,38 @@ class TestAllocateEvictPageAlignment:
 
         # Now exhaust free slots and trigger eviction
         cm._allocate(6)
-        assert len(cm.free_slots) == 0
+        assert len(cm.free_pages) == 0
 
         # Allocate 1 more page — must evict from cache
         allocated = cm._allocate(1)
         _assert_all_page_aligned(allocated, page_size, "allocated after evict")
-        _assert_all_page_aligned(cm.free_slots, page_size, "_free_slots after evict")
+        _assert_all_page_aligned(cm.free_pages, page_size, "_free_slots after evict")
+
+
+def test_duplicate_prefix_repoints_the_live_row_before_freeing_its_pages():
+    """Two misses on one prompt: the loser keeps decoding after its copy is freed."""
+    table = torch.zeros((2, 16), dtype=torch.int32)
+    cm = KVCacheManager(8, 1, table, cache_type="radix")
+    ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+
+    def admit(row):
+        handle = cm.prefix_cache.match_prefix(ids[:-1])
+        cm.lock(handle)
+        table[row, :4] = cm._page_to_token(cm._allocate(4))
+        return SimpleNamespace(
+            input_ids=ids.clone(), cached_len=4, table_idx=row, cache_handle=handle
+        )
+
+    winner, loser = admit(0), admit(1)
+    # Deferred frees are the production path, and they flush after the row changes.
+    with cm.defer_page_frees():
+        cm.cache_req(winner, finished=False)
+        cm.cache_req(loser, finished=False)
+
+    # The loser now reads the winner's pages; its own are free for reallocation.
+    assert table[1, :4].tolist() == table[0, :4].tolist()
+    assert not set(cm.free_pages.tolist()) & set(table[1, :4].tolist())
+    assert sorted(cm.free_pages.tolist()) == [4, 5, 6, 7]
 
 
 if __name__ == "__main__":

@@ -31,3 +31,9 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# reference-engine virtual environments for parity tests
+.parity/
+
+# committed parity evidence
+!docs/parity/**/*.json

@@ -1,41 +1,41 @@
-# Adapted from: https://github.com/GeeeekExplorer/nano-vllm/blob/main/bench.py
+"""Synthetic offline throughput; edit the workload constants below.
 
+Adapted from https://github.com/GeeeekExplorer/nano-vllm/blob/main/bench.py
+"""
+
+import random
 import time
-from random import randint, seed
 
 from minisgl.core import SamplingParams
 from minisgl.llm import LLM
 
 
 def main():
-    seed(0)
-    num_seqs = 256
-    max_input_len = 1024
-    max_ouput_len = 1024
-
-    # align the hyperparameters
-    llm = LLM(
+    random.seed(0)
+    num_requests, max_input_length, max_output_length = 256, 1024, 1024
+    prompts = [
+        [random.randint(0, 10000) for _ in range(random.randint(100, max_input_length))]
+        for _ in range(num_requests)
+    ]
+    settings = [
+        SamplingParams(
+            temperature=0.6, ignore_eos=True, max_tokens=random.randint(100, max_output_length)
+        )
+        for _ in prompts
+    ]
+    with LLM(
         "Qwen/Qwen3-0.6B",
         max_seq_len_override=4096,
         max_extend_tokens=16384,
         cuda_graph_max_bs=256,
         page_size=256,
-    )
-
-    prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)
-    ]
-    sampling_params = [
-        SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len))
-        for _ in range(num_seqs)
-    ]
-    llm.generate(["Benchmark: "], SamplingParams(temperature=0.1))  # to warm up flashinfer
-    t = time.time()
-    llm.generate(prompt_token_ids, sampling_params)
-    t = time.time() - t
-    total_tokens = sum(sp.max_tokens for sp in sampling_params)
-    throughput = total_tokens / t
-    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    ) as llm:
+        llm.generate([[1, 2, 3]], SamplingParams(max_tokens=2))  # Exclude JIT from timing.
+        started = time.perf_counter()
+        results = llm.generate(prompts, settings)
+        elapsed = time.perf_counter() - started
+    tokens = sum(len(result["token_ids"]) for result in results)
+    print(f"Output: {tokens} tokens, {elapsed:.2f} s, {tokens / elapsed:.2f} tokens/s")
 
 
 if __name__ == "__main__":

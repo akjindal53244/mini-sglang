@@ -1,73 +1,111 @@
-from __future__ import annotations
+"""CPU admission regressions: real page accounting, without loading a model."""
 
+from types import SimpleNamespace
+
+import pytest
 import torch
-import multiprocessing as mp
-from transformers import AutoTokenizer
-
-from minisgl.distributed import DistributedInfo
-from minisgl.message import BaseBackendMsg, BaseTokenizerMsg, DetokenizeMsg, ExitMsg, UserMsg
-from minisgl.scheduler import Scheduler, SchedulerConfig
-from minisgl.utils import ZmqPullQueue, ZmqPushQueue, call_if_main, init_logger
+from minisgl.config import Config
 from minisgl.core import SamplingParams
-
-logger = init_logger(__name__)
-
-
-@torch.inference_mode()
-def scheduler(config: SchedulerConfig, queue: mp.Queue) -> None:
-    scheduler = Scheduler(config)
-    queue.put(None)
-    try:
-        scheduler.run_forever()
-    except KeyboardInterrupt:
-        logger.info_rank0("Scheduler exiting...")
+from minisgl.kvcache import KVCacheManager
+from minisgl.message import AbortMsg, CancelledMsg, ErrorMsg, UserMsg
+from minisgl.scheduler import Scheduler
 
 
-@call_if_main(__name__)
-def main():
-    config = SchedulerConfig(
-        model_path="meta-llama/Llama-3.1-8B-Instruct",
-        tp_info=DistributedInfo(0, 1),
-        dtype=torch.bfloat16,
-        max_running_req=4,
-        cuda_graph_bs=[2, 4, 8],
-    )
+@pytest.fixture
+def scheduler(monkeypatch):
+    # Pinned transfers are exercised by smoke.py on GPU. Here retain real CPU
+    # token/page tables so admission, chunking, locks, and frees stay observable.
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
+    scheduler = object.__new__(Scheduler)
+    scheduler.config = Config("unused", page_size=4, max_running_req=8, max_extend_tokens=16)
+    table = torch.zeros((8, 32), dtype=torch.int32)
+    scheduler.engine = SimpleNamespace(page_table=table, max_seq_len=16)
+    scheduler.token_pool = torch.zeros_like(table)
+    scheduler.cache_manager = KVCacheManager(4, 4, table, "radix")
+    scheduler.free_rows = list(range(8))
+    scheduler.pending, scheduler.running, scheduler.in_flight = [], set(), None
+    return scheduler
 
-    mp.set_start_method("spawn", force=True)
-    q = mp.Queue()
-    p = mp.Process(target=scheduler, args=(config, q))
-    p.start()
-    q.get()
 
-    send_backend = ZmqPushQueue(
-        config.zmq_backend_addr,
-        create=False,
-        encoder=BaseBackendMsg.encoder,
-    )
-
-    recv_backend = ZmqPullQueue(
-        config.zmq_detokenizer_addr,
-        create=False,
-        decoder=BaseTokenizerMsg.decoder,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
-    prompt = "What's the answer to life, the universe, and everything?"
-    ids = tokenizer.encode(prompt, return_tensors="pt").view(-1).to(torch.int32)
-    send_backend.put(
-        UserMsg(
-            uid=0,
-            input_ids=ids,
-            sampling_params=SamplingParams(max_tokens=100),
+def test_admission_reserves_whole_pages_for_short_requests(scheduler):
+    for uid in range(7):
+        scheduler._handle_message(
+            UserMsg(uid, torch.tensor([uid], dtype=torch.int32), SamplingParams(max_tokens=1))
         )
+    batch = scheduler._prefill_batch()
+    assert len(batch.reqs) == 4  # Four physical pages, not sixteen one-token slots.
+    assert len(scheduler.pending) == 3
+    scheduler.cache_manager.allocate_paged(batch.reqs)
+    assert scheduler.cache_manager.free_pages.numel() == 0
+    for request in batch.reqs:
+        request.advance_after_forward()
+        scheduler._free_request(request)
+    scheduler.cache_manager.check_integrity()
+
+
+def test_chunked_prefill_keeps_one_row_and_emits_only_after_the_full_prompt(scheduler):
+    object.__setattr__(scheduler.config, "max_extend_tokens", 3)
+    ids = torch.arange(7, dtype=torch.int32)
+    scheduler._handle_message(UserMsg(0, ids, SamplingParams(max_tokens=2)))
+    rows, chunk_lengths, intermediate = [], [], []
+    while scheduler.pending:
+        request = scheduler._prefill_batch().reqs[0]
+        rows.append(request.table_idx)
+        chunk_lengths.append(request.num_new_tokens)
+        intermediate.append(request.is_prefill_chunk)
+        scheduler.cache_manager.allocate_paged([request])
+        request.advance_after_forward()
+    assert chunk_lengths == [3, 3, 1]
+    assert intermediate == [True, True, False]
+    assert len(set(rows)) == 1
+    assert torch.equal(scheduler.token_pool[rows[0], :7], ids)
+    scheduler._free_request(request)
+    scheduler.cache_manager.check_integrity()
+
+
+def test_matching_prefix_is_locked_and_mapped_before_the_row_is_used(scheduler):
+    ids = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
+    pages = scheduler.cache_manager._allocate(1)
+    locations = scheduler.cache_manager._page_to_token(pages)
+    scheduler.cache_manager.prefix_cache.insert_prefix(ids, locations)
+    scheduler._handle_message(
+        UserMsg(0, torch.tensor([1, 2, 3, 4, 5], dtype=torch.int32), SamplingParams(max_tokens=2))
     )
+    request = scheduler._prefill_batch().reqs[0]
+    assert request.cached_len == 4
+    assert scheduler.cache_manager.prefix_cache.protected_size == 4
+    assert torch.equal(scheduler.engine.page_table[request.table_idx, :4], locations)
+    assert scheduler.token_pool[request.table_idx, 4] == 5  # Only the new token is staged.
 
-    while True:
-        msg = recv_backend.get()
-        assert isinstance(msg, DetokenizeMsg)
-        ids = torch.cat([ids, torch.tensor([msg.next_token], dtype=torch.int32)])
-        if msg.finished:
-            break
 
-    logger.info(tokenizer.decode(ids.tolist()))
-    send_backend.put(ExitMsg())
+def test_abort_during_chunking_releases_its_row_and_pages_once(scheduler):
+    object.__setattr__(scheduler.config, "max_extend_tokens", 3)
+    scheduler._handle_message(
+        UserMsg(0, torch.arange(7, dtype=torch.int32), SamplingParams(max_tokens=2))
+    )
+    request = scheduler._prefill_batch().reqs[0]
+    scheduler.cache_manager.allocate_paged([request])
+    request.advance_after_forward()
+    assert scheduler._handle_message(AbortMsg(0)) == [CancelledMsg(0)]
+    assert scheduler.idle and request.is_finished
+    scheduler._handle_message(AbortMsg(0))
+    assert len(set(scheduler.free_rows)) == len(scheduler.free_rows) == 8
+    scheduler.cache_manager.check_integrity()
+
+
+def test_context_clipping_does_not_mutate_shared_sampling_settings(scheduler):
+    params = SamplingParams(max_tokens=10)
+    scheduler._handle_message(UserMsg(0, torch.arange(14, dtype=torch.int32), params))
+    scheduler._handle_message(UserMsg(1, torch.arange(3, dtype=torch.int32), params))
+    assert [request.sampling_params.max_tokens for request in scheduler.pending] == [2, 10]
+    assert params.max_tokens == 10
+
+
+@pytest.mark.parametrize("length", [0, 16, 17])
+def test_invalid_prompt_returns_an_error_instead_of_leaving_a_waiting_client(scheduler, length):
+    replies = scheduler._handle_message(
+        UserMsg(42, torch.arange(length, dtype=torch.int32), SamplingParams())
+    )
+    assert len(replies) == 1 and isinstance(replies[0], ErrorMsg)
+    assert replies[0].uid == 42
+    assert scheduler.idle

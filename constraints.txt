@@ -1,0 +1,22 @@
+# Reference environment: Linux, Python 3.12, PyTorch CUDA 12.8.
+# Use with -c constraints.txt; see README for the installation command.
+torch==2.9.1
+transformers==4.57.3
+flashinfer-python==0.7.2.post1
+sgl-kernel==0.3.21
+apache-tvm-ffi==0.1.15.post2
+triton==3.5.1
+numpy==2.5.4
+safetensors==0.8.0
+huggingface-hub==0.36.2
+tqdm==4.70.1
+msgpack==1.2.4
+pyzmq==27.2.0
+fastapi==0.162.0
+pydantic==2.14.2
+uvicorn==0.54.0
+prompt-toolkit==3.0.53
+openai==3.42.0
+pytest==9.2.0
+black==26.10.1
+ruff==0.17.3
